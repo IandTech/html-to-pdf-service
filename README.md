@@ -359,6 +359,11 @@ curl -X POST http://localhost:10000/convert/email-to-pdf \
 
 Construye un arreglo `items` y envialo al mismo endpoint. Cuando la respuesta sea JSON, cada resultado exitoso trae su propio `contentBase64`.
 
+Nota para Power Automate:
+
+- Para `.eml` y `.msg`, la API tolera un escenario comun donde el adjunto llega doble codificado en Base64 y trata de normalizarlo automaticamente antes del parser.
+- Aun asi, el valor ideal para `contentBase64` sigue siendo el Base64 real del archivo, no el MIME crudo en texto.
+
 ## Despliegue en Railway
 
 1. Sube el proyecto a GitHub.

@@ -32,6 +32,7 @@ from playwright.async_api import (
     async_playwright,
 )
 from pydantic import BaseModel, Field
+from services.base64_helper import maybe_double_decode_email_file
 
 
 SERVICE_NAME = "html-to-pdf-service"
@@ -1283,7 +1284,17 @@ async def process_universal_item(
         )
 
     if detected_type in {"eml", "msg"}:
-        extracted_email = extract_email_content(file_bytes, original_file_name)
+        normalized_file_bytes, double_base64_detected = maybe_double_decode_email_file(file_bytes, extension)
+        if double_base64_detected:
+            log_event(
+                logging.WARNING,
+                "DOUBLE_BASE64_DETECTED",
+                traceId=request.state.trace_id,
+                fileName=original_file_name,
+                detectedType=detected_type,
+            )
+
+        extracted_email = extract_email_content(normalized_file_bytes, original_file_name)
         preview_html = build_email_preview_html(
             original_file_name=original_file_name or f"correo{extension}",
             ticket_id=str(metadata.get("ticketId")) if metadata.get("ticketId") is not None else None,
@@ -1299,7 +1310,7 @@ async def process_universal_item(
             originalFileName=original_file_name,
             detectedType=detected_type,
             fileExtension=extension,
-            fileSizeBytes=len(file_bytes),
+            fileSizeBytes=len(normalized_file_bytes),
             parserUsed=extracted_email.parser_used,
             hasHtmlBody=extracted_email.has_html_body,
             hasPlainTextBody=extracted_email.has_plain_text_body,
@@ -1310,6 +1321,7 @@ async def process_universal_item(
             cidFoundCount=extracted_email.cid_found_count,
             cidResolvedCount=extracted_email.cid_resolved_count,
             unresolvedInlineImageCount=extracted_email.unresolved_inline_count,
+            doubleBase64Detected=double_base64_detected,
             warnings=extracted_email.warnings or [],
             parseTimeMs=parse_time_ms,
             metadata=metadata,
