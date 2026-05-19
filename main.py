@@ -338,6 +338,34 @@ def normalize_item_metadata(metadata: Any) -> dict[str, Any]:
     return metadata
 
 
+def resolve_item_content_mode(item: dict[str, Any]) -> str:
+    has_html = item.get("html") is not None
+    has_file = item.get("contentBase64") is not None
+
+    if has_html and has_file:
+        raise ServiceError(
+            status_code=400,
+            error_code="AMBIGUOUS_CONTENT",
+            error_type="ValidationError",
+            message="The request contains both html and contentBase64.",
+            technical_detail="Provide either html or contentBase64, but not both.",
+        )
+
+    if has_html:
+        return "html"
+
+    if has_file:
+        return "file"
+
+    raise ServiceError(
+        status_code=400,
+        error_code="MISSING_CONTENT",
+        error_type="ValidationError",
+        message="The request does not contain html or contentBase64.",
+        technical_detail="Each item must include html or contentBase64.",
+    )
+
+
 def validate_html_payload(html: Any) -> str:
     if html is None:
         raise ServiceError(
@@ -502,12 +530,13 @@ def build_email_preview_html(
 """.strip()
 
 
-def detect_document_type(item: dict[str, Any]) -> str:
+def detect_document_type(item: dict[str, Any], content_mode: str) -> str:
     file_name = item.get("fileName")
     extension = detect_file_extension(file_name)
 
-    if item.get("html") is not None:
+    if content_mode == "html":
         return "html"
+
     if extension in HTML_EXTENSIONS:
         return "html"
     if extension == ".eml":
@@ -949,26 +978,14 @@ async def process_universal_item(
     parse_start = time.perf_counter()
     metadata = normalize_item_metadata(item.get("metadata"))
     original_file_name = item.get("fileName") if isinstance(item.get("fileName"), str) else None
-    detected_type = detect_document_type(item)
+    content_mode = resolve_item_content_mode(item)
+    detected_type = detect_document_type(item, content_mode)
     output_file_name = build_pdf_filename(original_file_name, original_file_name or detected_type)
 
     request.state.file_name = output_file_name
 
-    if detected_type == "html":
+    if content_mode == "html":
         html_text = item.get("html")
-        if html_text is None and item.get("contentBase64") is not None:
-            html_bytes = decode_base64_payload(item.get("contentBase64"))
-            html_text = decode_bytes_to_text(html_bytes)
-
-        if detected_type == "html" and item.get("html") is None and item.get("contentBase64") is None:
-            raise ServiceError(
-                status_code=400,
-                error_code="HTML_EMPTY",
-                error_type="ValidationError",
-                message="The HTML content received is empty.",
-                technical_detail="Request body html property was null or blank.",
-            )
-
         parse_time_ms = round((time.perf_counter() - parse_start) * 1000, 2)
         log_event(
             logging.INFO,
@@ -1010,6 +1027,47 @@ async def process_universal_item(
     file_bytes = decode_base64_payload(item.get("contentBase64"))
     request.state.html_size = len(file_bytes)
     extension = detect_file_extension(original_file_name)
+
+    if detected_type == "html":
+        html_text = decode_bytes_to_text(file_bytes)
+        parse_time_ms = round((time.perf_counter() - parse_start) * 1000, 2)
+        log_event(
+            logging.INFO,
+            "document_parsed",
+            traceId=request.state.trace_id,
+            index=index,
+            originalFileName=original_file_name,
+            detectedType=detected_type,
+            fileExtension=extension,
+            fileSizeBytes=len(file_bytes),
+            parseTimeMs=parse_time_ms,
+            metadata=metadata,
+        )
+
+        render_start = time.perf_counter()
+        rendered = await render_pdf_document(str(html_text), output_file_name, request)
+        render_time_ms = round((time.perf_counter() - render_start) * 1000, 2)
+
+        log_event(
+            logging.INFO,
+            "document_rendered",
+            traceId=request.state.trace_id,
+            index=index,
+            originalFileName=original_file_name,
+            detectedType=detected_type,
+            renderTimeMs=render_time_ms,
+            finalStatus=rendered.final_status,
+        )
+
+        return ProcessedItemResult(
+            index=index,
+            original_file_name=original_file_name or "document.html",
+            output_file_name=output_file_name,
+            detected_type=detected_type,
+            pdf_bytes=rendered.pdf_bytes,
+            metadata={"detectedType": detected_type, **metadata},
+            response_headers=rendered.response_headers,
+        )
 
     if detected_type in {"eml", "msg"}:
         extracted_email = extract_email_content(file_bytes, original_file_name)

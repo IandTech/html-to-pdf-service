@@ -100,6 +100,13 @@ Request:
 }
 ```
 
+Reglas del contenido por item:
+
+- si viene `html`, se procesa como HTML
+- si viene `contentBase64`, se procesa como archivo
+- si no viene ninguno, devuelve `MISSING_CONTENT`
+- si vienen ambos, devuelve `AMBIGUOUS_CONTENT`
+
 Respuesta:
 
 - `HTTP 200`
@@ -382,6 +389,14 @@ El payload HTML no pudo procesarse.
 ### `INVALID_BASE64` - HTTP 400
 
 El contenido recibido no es un Base64 valido.
+
+### `MISSING_CONTENT` - HTTP 400
+
+El item no incluye `html` ni `contentBase64`.
+
+### `AMBIGUOUS_CONTENT` - HTTP 400
+
+El item incluye `html` y `contentBase64` al mismo tiempo.
 
 ### `UNSUPPORTED_EXTENSION` - HTTP 400
 
