@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: html-to-pdf-service
+    env: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: RENDER_TIMEOUT_MS
+        value: 30000
+      - key: LOG_LEVEL
+        value: INFO
