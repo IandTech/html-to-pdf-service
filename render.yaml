@@ -12,3 +12,5 @@ services:
         value: INFO
       - key: STRICT_EXTERNAL_RESOURCES
         value: false
+      - key: LIBREOFFICE_BINARY
+        value: libreoffice

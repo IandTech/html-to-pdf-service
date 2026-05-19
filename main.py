@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import re
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import extract_msg
-from fastapi import FastAPI, File, Form, Request, Response, UploadFile
+from fastapi import Body, FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -36,6 +37,10 @@ from pydantic import BaseModel, Field
 SERVICE_NAME = "html-to-pdf-service"
 SERVICE_VERSION = "1.0.0"
 DEFAULT_FILE_NAME = "document.pdf"
+HTML_EXTENSIONS = {".html", ".htm"}
+EMAIL_EXTENSIONS = {".eml", ".msg"}
+OFFICE_EXTENSIONS = {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
+TEXT_EXTENSIONS = {".txt"}
 
 
 def env_to_bool(value: str | None, default: bool = False) -> bool:
@@ -48,6 +53,7 @@ class Settings:
     def __init__(self) -> None:
         self.render_timeout_ms = int(os.getenv("RENDER_TIMEOUT_MS", "30000"))
         self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+        self.libreoffice_binary = os.getenv("LIBREOFFICE_BINARY", "libreoffice")
         self.strict_external_resources = env_to_bool(
             os.getenv("STRICT_EXTERNAL_RESOURCES"),
             default=False,
@@ -99,7 +105,31 @@ class ConvertHtmlRequest(BaseModel):
 class ExtractedEmailContent:
     html: str
     subject: str | None
+    sender: str | None
+    to: str | None
+    cc: str | None
+    date: str | None
     source_format: str
+    unresolved_inline_count: int = 0
+
+
+@dataclass
+class RenderedPdfResult:
+    pdf_bytes: bytes
+    response_headers: dict[str, str]
+    final_status: str
+    failed_resource_count: int
+
+
+@dataclass
+class ProcessedItemResult:
+    index: int
+    original_file_name: str
+    output_file_name: str
+    detected_type: str
+    pdf_bytes: bytes
+    metadata: dict[str, Any]
+    response_headers: dict[str, str]
 
 
 class ServiceError(Exception):
@@ -204,6 +234,110 @@ def build_pdf_filename(preferred_file_name: str | None, source_name: str | None 
     return DEFAULT_FILE_NAME
 
 
+def sanitize_original_filename(file_name: str | None, fallback: str = "document") -> str:
+    if not file_name:
+        return fallback
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", file_name.strip())
+    return cleaned.strip("._") or fallback
+
+
+def detect_file_extension(file_name: str | None) -> str:
+    return Path(file_name or "").suffix.lower()
+
+
+def decode_base64_payload(content_base64: Any) -> bytes:
+    if content_base64 is None:
+        raise ServiceError(
+            status_code=400,
+            error_code="EMPTY_FILE",
+            error_type="ValidationError",
+            message="El archivo adjunto esta vacio.",
+            technical_detail="contentBase64 is null, blank or decoded to zero bytes.",
+        )
+
+    if not isinstance(content_base64, str) or not content_base64.strip():
+        raise ServiceError(
+            status_code=400,
+            error_code="EMPTY_FILE",
+            error_type="ValidationError",
+            message="El archivo adjunto esta vacio.",
+            technical_detail="contentBase64 is null, blank or decoded to zero bytes.",
+        )
+
+    payload = content_base64.strip()
+    if "," in payload and payload.lower().startswith("data:"):
+        payload = payload.split(",", 1)[1]
+
+    try:
+        decoded = base64.b64decode(payload, validate=True)
+    except Exception as exc:
+        raise ServiceError(
+            status_code=400,
+            error_code="INVALID_BASE64",
+            error_type="ValidationError",
+            message="El contenido recibido no es un Base64 valido.",
+            technical_detail="Base64 decode failed.",
+        ) from exc
+
+    if not decoded:
+        raise ServiceError(
+            status_code=400,
+            error_code="EMPTY_FILE",
+            error_type="ValidationError",
+            message="El archivo adjunto esta vacio.",
+            technical_detail="contentBase64 is null, blank or decoded to zero bytes.",
+        )
+
+    return decoded
+
+
+def normalize_universal_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise ServiceError(
+            status_code=400,
+            error_code="INVALID_REQUEST_BODY",
+            error_type="ValidationError",
+            message="The request body could not be processed.",
+            technical_detail="Request body must be a JSON object.",
+        )
+
+    if "items" in payload:
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            raise ServiceError(
+                status_code=400,
+                error_code="INVALID_REQUEST_BODY",
+                error_type="ValidationError",
+                message="The request body could not be processed.",
+                technical_detail="items must be a non-empty JSON array.",
+            )
+        if any(not isinstance(item, dict) for item in items):
+            raise ServiceError(
+                status_code=400,
+                error_code="INVALID_REQUEST_BODY",
+                error_type="ValidationError",
+                message="The request body could not be processed.",
+                technical_detail="Each item inside items must be a JSON object.",
+            )
+        return items
+
+    return [payload]
+
+
+def normalize_item_metadata(metadata: Any) -> dict[str, Any]:
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        raise ServiceError(
+            status_code=400,
+            error_code="INVALID_REQUEST_BODY",
+            error_type="ValidationError",
+            message="The request body could not be processed.",
+            technical_detail="metadata must be a JSON object.",
+        )
+    return metadata
+
+
 def validate_html_payload(html: Any) -> str:
     if html is None:
         raise ServiceError(
@@ -303,6 +437,10 @@ def embed_inline_resources(html: str, inline_resources: dict[str, dict[str, Any]
     return re.sub(r"cid:([^\"' >)]+)", replace_cid, html, flags=re.IGNORECASE)
 
 
+def count_unresolved_cids(html: str) -> int:
+    return len(re.findall(r"cid:[^\"' >)]+", html, flags=re.IGNORECASE))
+
+
 def text_to_html_document(text: str) -> str:
     escaped_text = html_escape(text or "")
     body_html = escaped_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
@@ -311,6 +449,163 @@ def text_to_html_document(text: str) -> str:
         f"{body_html}"
         "</body></html>"
     )
+
+
+def build_email_preview_html(
+    *,
+    original_file_name: str,
+    ticket_id: str | None,
+    extracted_email: ExtractedEmailContent,
+) -> str:
+    fields = [
+        ("Archivo original", original_file_name),
+        ("Subject", extracted_email.subject),
+        ("From", extracted_email.sender),
+        ("To", extracted_email.to),
+        ("CC", extracted_email.cc),
+        ("Date", extracted_email.date),
+        ("TicketId", ticket_id),
+    ]
+
+    metadata_rows = []
+    for label, value in fields:
+        safe_value = html_escape(value or "")
+        metadata_rows.append(
+            "<tr>"
+            f"<th style=\"text-align:left; vertical-align:top; padding:6px 10px; border:1px solid #d9d9d9; background:#f5f5f5; width:180px;\">{html_escape(label)}</th>"
+            f"<td style=\"padding:6px 10px; border:1px solid #d9d9d9;\">{safe_value or '&nbsp;'}</td>"
+            "</tr>"
+        )
+
+    unresolved_note = ""
+    if extracted_email.unresolved_inline_count > 0:
+        unresolved_note = (
+            "<p style=\"margin-top:16px; color:#8a6d3b; font-size:12px;\">"
+            f"Nota: {extracted_email.unresolved_inline_count} imagen(es) inline no pudieron resolverse y pueden no aparecer en el PDF."
+            "</p>"
+        )
+
+    return f"""
+<html>
+  <body style="font-family: Arial, sans-serif; color: #1f2937; padding: 18px;">
+    <h1 style="font-size: 24px; margin-bottom: 18px;">Correo adjunto Trade Ticket</h1>
+    <table style="border-collapse: collapse; width: 100%; margin-bottom: 18px;">
+      {''.join(metadata_rows)}
+    </table>
+    <hr style="border: 0; border-top: 1px solid #d9d9d9; margin: 18px 0;">
+    <div style="font-size: 12px; line-height: 1.45;">
+      {extracted_email.html}
+    </div>
+    {unresolved_note}
+  </body>
+</html>
+""".strip()
+
+
+def detect_document_type(item: dict[str, Any]) -> str:
+    file_name = item.get("fileName")
+    extension = detect_file_extension(file_name)
+
+    if item.get("html") is not None:
+        return "html"
+    if extension in HTML_EXTENSIONS:
+        return "html"
+    if extension == ".eml":
+        return "eml"
+    if extension == ".msg":
+        return "msg"
+    if extension in OFFICE_EXTENSIONS:
+        return extension.lstrip(".")
+    if extension in TEXT_EXTENSIONS:
+        return "txt"
+
+    raise ServiceError(
+        status_code=400,
+        error_code="UNSUPPORTED_EXTENSION",
+        error_type="ValidationError",
+        message="Solo se soportan archivos .eml y .msg, HTML, Word, Excel y PowerPoint.",
+        technical_detail=f"Received extension: {extension or '(none)'}",
+    )
+
+
+async def convert_office_bytes_to_pdf(file_bytes: bytes, original_file_name: str) -> bytes:
+    extension = detect_file_extension(original_file_name)
+    safe_original_name = sanitize_original_filename(original_file_name, fallback=f"source{extension or ''}")
+
+    with tempfile.TemporaryDirectory(prefix="office-input-") as temp_dir:
+        input_path = Path(temp_dir) / safe_original_name
+        output_dir = Path(temp_dir) / "output"
+        profile_dir = Path(temp_dir) / "profile"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        input_path.write_bytes(file_bytes)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                settings.libreoffice_binary,
+                "--headless",
+                "--nologo",
+                "--nolockcheck",
+                "--nodefault",
+                "--nofirststartwizard",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(output_dir),
+                f"-env:UserInstallation=file://{profile_dir.as_posix()}",
+                str(input_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise ServiceError(
+                status_code=500,
+                error_code="OFFICE_CONVERSION_UNAVAILABLE",
+                error_type="ConversionError",
+                message="Office document conversion is not available in this environment.",
+                technical_detail=f"Executable not found: {settings.libreoffice_binary}",
+            ) from exc
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=settings.render_timeout_ms / 1000,
+            )
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.communicate()
+            raise ServiceError(
+                status_code=408,
+                error_code="PDF_RENDER_TIMEOUT",
+                error_type="TimeoutError",
+                message="La generacion del PDF excedio el tiempo permitido.",
+                technical_detail="Office conversion timeout exceeded.",
+            ) from exc
+
+        if process.returncode != 0:
+            raise ServiceError(
+                status_code=422,
+                error_code="OFFICE_CONVERSION_FAILED",
+                error_type="ConversionError",
+                message="The Office document could not be converted to PDF.",
+                technical_detail=(
+                    (stderr or stdout or b"LibreOffice conversion failed.")
+                    .decode("utf-8", errors="replace")
+                    .strip()
+                ),
+            )
+
+        pdf_path = output_dir / f"{input_path.stem}.pdf"
+        if not pdf_path.exists():
+            raise ServiceError(
+                status_code=422,
+                error_code="OFFICE_CONVERSION_FAILED",
+                error_type="ConversionError",
+                message="The Office document could not be converted to PDF.",
+                technical_detail="LibreOffice finished without producing the expected PDF output file.",
+            )
+
+        return pdf_path.read_bytes()
 
 
 def extract_email_content(file_bytes: bytes, file_name: str | None) -> ExtractedEmailContent:
@@ -347,9 +642,9 @@ def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
         raise ServiceError(
             status_code=422,
             error_code="EMAIL_CONTENT_EXTRACTION_FAILED",
-            error_type="EmailParsingError",
-            message="The email file could not be processed.",
-            technical_detail=f"Python email parser failed to read the .eml file: {exc}",
+            error_type="ParsingError",
+            message="No se pudo extraer el contenido del correo.",
+            technical_detail="Python email parser failed to read the .eml file.",
         ) from exc
 
     html_body: str | None = None
@@ -390,73 +685,106 @@ def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
         raise ServiceError(
             status_code=422,
             error_code="EMAIL_BODY_NOT_FOUND",
-            error_type="EmailParsingError",
-            message="The email file does not contain renderable content.",
+            error_type="ParsingError",
+            message="No se pudo extraer el contenido del correo.",
             technical_detail="No HTML body or plain text body could be extracted from the .eml file.",
         )
 
+    final_html = embed_inline_resources(html_body, inline_resources)
     return ExtractedEmailContent(
-        html=embed_inline_resources(html_body, inline_resources),
+        html=final_html,
         subject=message.get("Subject"),
+        sender=message.get("From"),
+        to=message.get("To"),
+        cc=message.get("Cc"),
+        date=message.get("Date"),
         source_format="eml",
+        unresolved_inline_count=count_unresolved_cids(final_html),
     )
 
 
 def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
     msg = None
+    temp_msg_path: str | None = None
     try:
-        msg = extract_msg.Message(file_bytes)
-        html_body = decode_bytes_to_text(getattr(msg, "htmlBody", None))
-        plain_body = getattr(msg, "body", None)
-        inline_resources: dict[str, dict[str, Any]] = {}
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".msg") as temp_msg_file:
+            temp_msg_file.write(file_bytes)
+            temp_msg_path = temp_msg_file.name
 
-        for attachment in getattr(msg, "attachments", []):
-            content_id = normalize_content_id(
-                getattr(attachment, "cid", None) or getattr(attachment, "contentId", None)
+        try:
+            msg = extract_msg.openMsg(temp_msg_path)
+            html_body = decode_bytes_to_text(getattr(msg, "htmlBody", None))
+            plain_body = getattr(msg, "body", None)
+            inline_resources: dict[str, dict[str, Any]] = {}
+
+            for attachment in getattr(msg, "attachments", []):
+                content_id = normalize_content_id(
+                    getattr(attachment, "cid", None) or getattr(attachment, "contentId", None)
+                )
+                attachment_data = getattr(attachment, "data", None)
+
+                if not content_id or not isinstance(attachment_data, bytes):
+                    continue
+
+                attachment_name = (
+                    getattr(attachment, "name", None)
+                    or getattr(attachment, "longFilename", None)
+                    or getattr(attachment, "shortFilename", None)
+                    or ""
+                )
+                mime_type = getattr(attachment, "mimetype", None) or mimetypes.guess_type(attachment_name)[0]
+                inline_resources[content_id] = {
+                    "data": attachment_data,
+                    "mimeType": mime_type or "application/octet-stream",
+                }
+
+            if not html_body and plain_body:
+                html_body = text_to_html_document(plain_body)
+
+            if not html_body:
+                raise ServiceError(
+                    status_code=422,
+                    error_code="EMAIL_BODY_NOT_FOUND",
+                    error_type="ParsingError",
+                    message="No se pudo extraer el contenido del correo.",
+                    technical_detail="No HTML body or plain text body found.",
+                )
+
+            final_html = embed_inline_resources(html_body, inline_resources)
+            sender = (
+                getattr(msg, "sender", None)
+                or getattr(msg, "senderEmail", None)
+                or getattr(msg, "sender_email", None)
             )
-            attachment_data = getattr(attachment, "data", None)
+            to_value = getattr(msg, "to", None)
+            cc_value = getattr(msg, "cc", None)
+            date_value = decode_bytes_to_text(getattr(msg, "date", None)) or str(getattr(msg, "date", "") or "")
 
-            if not content_id or not isinstance(attachment_data, bytes):
-                continue
-
-            attachment_name = (
-                getattr(attachment, "name", None)
-                or getattr(attachment, "longFilename", None)
-                or getattr(attachment, "shortFilename", None)
-                or ""
+            return ExtractedEmailContent(
+                html=final_html,
+                subject=getattr(msg, "subject", None),
+                sender=sender,
+                to=to_value,
+                cc=cc_value,
+                date=date_value or None,
+                source_format="msg",
+                unresolved_inline_count=count_unresolved_cids(final_html),
             )
-            mime_type = getattr(attachment, "mimetype", None) or mimetypes.guess_type(attachment_name)[0]
-            inline_resources[content_id] = {
-                "data": attachment_data,
-                "mimeType": mime_type or "application/octet-stream",
-            }
-
-        if not html_body and plain_body:
-            html_body = text_to_html_document(plain_body)
-
-        if not html_body:
-            raise ServiceError(
-                status_code=422,
-                error_code="EMAIL_BODY_NOT_FOUND",
-                error_type="EmailParsingError",
-                message="The email file does not contain renderable content.",
-                technical_detail="No HTML body or plain text body could be extracted from the .msg file.",
-            )
-
-        return ExtractedEmailContent(
-            html=embed_inline_resources(html_body, inline_resources),
-            subject=getattr(msg, "subject", None),
-            source_format="msg",
-        )
+        finally:
+            if temp_msg_path:
+                try:
+                    Path(temp_msg_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
     except ServiceError:
         raise
     except Exception as exc:
         raise ServiceError(
             status_code=422,
-            error_code="EMAIL_CONTENT_EXTRACTION_FAILED",
-            error_type="EmailParsingError",
-            message="The email file could not be processed.",
-            technical_detail=f"extract-msg failed to read the .msg file: {exc}",
+            error_code="MSG_PARSE_FAILED",
+            error_type="ParsingError",
+            message="No se pudo procesar el archivo .msg.",
+            technical_detail="extract-msg failed with controlled error.",
         ) from exc
     finally:
         if msg is not None:
@@ -485,7 +813,7 @@ async def create_page(browser: Browser) -> tuple[BrowserContext, Page]:
     return context, page
 
 
-async def render_pdf_response(html: str, file_name: str, request: Request) -> Response:
+async def render_pdf_document(html: str, file_name: str, request: Request) -> RenderedPdfResult:
     html = validate_html_payload(html)
     external_urls = extract_external_resource_urls(html)
 
@@ -590,16 +918,256 @@ async def render_pdf_response(html: str, file_name: str, request: Request) -> Re
             response_headers["X-External-Resources-Status"] = "warning"
             response_headers["X-Failed-Resource-Count"] = str(len(failed_resources))
 
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers=response_headers,
+        return RenderedPdfResult(
+            pdf_bytes=pdf_bytes,
+            response_headers=response_headers,
+            final_status=request.state.final_status,
+            failed_resource_count=request.state.failed_resource_count,
         )
     finally:
         if page is not None:
             await page.close()
         if context is not None:
             await context.close()
+
+
+async def render_pdf_response(html: str, file_name: str, request: Request) -> Response:
+    rendered = await render_pdf_document(html, file_name, request)
+    return Response(
+        content=rendered.pdf_bytes,
+        media_type="application/pdf",
+        headers=rendered.response_headers,
+    )
+
+
+async def process_universal_item(
+    item: dict[str, Any],
+    *,
+    index: int,
+    request: Request,
+) -> ProcessedItemResult:
+    parse_start = time.perf_counter()
+    metadata = normalize_item_metadata(item.get("metadata"))
+    original_file_name = item.get("fileName") if isinstance(item.get("fileName"), str) else None
+    detected_type = detect_document_type(item)
+    output_file_name = build_pdf_filename(original_file_name, original_file_name or detected_type)
+
+    request.state.file_name = output_file_name
+
+    if detected_type == "html":
+        html_text = item.get("html")
+        if html_text is None and item.get("contentBase64") is not None:
+            html_bytes = decode_base64_payload(item.get("contentBase64"))
+            html_text = decode_bytes_to_text(html_bytes)
+
+        if detected_type == "html" and item.get("html") is None and item.get("contentBase64") is None:
+            raise ServiceError(
+                status_code=400,
+                error_code="HTML_EMPTY",
+                error_type="ValidationError",
+                message="The HTML content received is empty.",
+                technical_detail="Request body html property was null or blank.",
+            )
+
+        parse_time_ms = round((time.perf_counter() - parse_start) * 1000, 2)
+        log_event(
+            logging.INFO,
+            "document_parsed",
+            traceId=request.state.trace_id,
+            index=index,
+            originalFileName=original_file_name,
+            detectedType=detected_type,
+            parseTimeMs=parse_time_ms,
+            metadata=metadata,
+        )
+
+        render_start = time.perf_counter()
+        rendered = await render_pdf_document(str(html_text), output_file_name, request)
+        render_time_ms = round((time.perf_counter() - render_start) * 1000, 2)
+
+        log_event(
+            logging.INFO,
+            "document_rendered",
+            traceId=request.state.trace_id,
+            index=index,
+            originalFileName=original_file_name,
+            detectedType=detected_type,
+            renderTimeMs=render_time_ms,
+            finalStatus=rendered.final_status,
+        )
+
+        result_metadata = {"detectedType": detected_type, **metadata}
+        return ProcessedItemResult(
+            index=index,
+            original_file_name=original_file_name or "document.html",
+            output_file_name=output_file_name,
+            detected_type=detected_type,
+            pdf_bytes=rendered.pdf_bytes,
+            metadata=result_metadata,
+            response_headers=rendered.response_headers,
+        )
+
+    file_bytes = decode_base64_payload(item.get("contentBase64"))
+    request.state.html_size = len(file_bytes)
+    extension = detect_file_extension(original_file_name)
+
+    if detected_type in {"eml", "msg"}:
+        extracted_email = extract_email_content(file_bytes, original_file_name)
+        preview_html = build_email_preview_html(
+            original_file_name=original_file_name or f"correo{extension}",
+            ticket_id=str(metadata.get("ticketId")) if metadata.get("ticketId") is not None else None,
+            extracted_email=extracted_email,
+        )
+
+        parse_time_ms = round((time.perf_counter() - parse_start) * 1000, 2)
+        log_event(
+            logging.INFO,
+            "document_parsed",
+            traceId=request.state.trace_id,
+            index=index,
+            originalFileName=original_file_name,
+            detectedType=detected_type,
+            fileExtension=extension,
+            fileSizeBytes=len(file_bytes),
+            parseTimeMs=parse_time_ms,
+            metadata=metadata,
+        )
+
+        render_start = time.perf_counter()
+        rendered = await render_pdf_document(preview_html, output_file_name, request)
+        render_time_ms = round((time.perf_counter() - render_start) * 1000, 2)
+
+        log_event(
+            logging.INFO,
+            "document_rendered",
+            traceId=request.state.trace_id,
+            index=index,
+            originalFileName=original_file_name,
+            detectedType=detected_type,
+            renderTimeMs=render_time_ms,
+            finalStatus=rendered.final_status,
+        )
+
+        result_metadata = {
+            "detectedType": detected_type,
+            **metadata,
+            "subject": extracted_email.subject,
+            "from": extracted_email.sender,
+            "to": extracted_email.to,
+            "cc": extracted_email.cc,
+            "date": extracted_email.date,
+        }
+        return ProcessedItemResult(
+            index=index,
+            original_file_name=original_file_name or f"correo{extension}",
+            output_file_name=output_file_name,
+            detected_type=detected_type,
+            pdf_bytes=rendered.pdf_bytes,
+            metadata=result_metadata,
+            response_headers=rendered.response_headers,
+        )
+
+    if detected_type == "txt":
+        parse_time_ms = round((time.perf_counter() - parse_start) * 1000, 2)
+        log_event(
+            logging.INFO,
+            "document_parsed",
+            traceId=request.state.trace_id,
+            index=index,
+            originalFileName=original_file_name,
+            detectedType=detected_type,
+            fileExtension=extension,
+            fileSizeBytes=len(file_bytes),
+            parseTimeMs=parse_time_ms,
+            metadata=metadata,
+        )
+
+        render_start = time.perf_counter()
+        rendered = await render_pdf_document(
+            text_to_html_document(decode_bytes_to_text(file_bytes) or ""),
+            output_file_name,
+            request,
+        )
+        render_time_ms = round((time.perf_counter() - render_start) * 1000, 2)
+        log_event(
+            logging.INFO,
+            "document_rendered",
+            traceId=request.state.trace_id,
+            index=index,
+            originalFileName=original_file_name,
+            detectedType=detected_type,
+            renderTimeMs=render_time_ms,
+            finalStatus=rendered.final_status,
+        )
+        return ProcessedItemResult(
+            index=index,
+            original_file_name=original_file_name or "document.txt",
+            output_file_name=output_file_name,
+            detected_type=detected_type,
+            pdf_bytes=rendered.pdf_bytes,
+            metadata={"detectedType": detected_type, **metadata},
+            response_headers=rendered.response_headers,
+        )
+
+    parse_time_ms = round((time.perf_counter() - parse_start) * 1000, 2)
+    log_event(
+        logging.INFO,
+        "document_parsed",
+        traceId=request.state.trace_id,
+        index=index,
+        originalFileName=original_file_name,
+        detectedType=detected_type,
+        fileExtension=extension,
+        fileSizeBytes=len(file_bytes),
+        parseTimeMs=parse_time_ms,
+        metadata=metadata,
+    )
+
+    render_start = time.perf_counter()
+    pdf_bytes = await convert_office_bytes_to_pdf(file_bytes, original_file_name or f"document{extension}")
+    render_time_ms = round((time.perf_counter() - render_start) * 1000, 2)
+    request.state.final_status = "SUCCESS"
+    request.state.failed_resource_count = 0
+    request.state.external_resource_count = 0
+
+    log_event(
+        logging.INFO,
+        "document_rendered",
+        traceId=request.state.trace_id,
+        index=index,
+        originalFileName=original_file_name,
+        detectedType=detected_type,
+        renderTimeMs=render_time_ms,
+        finalStatus="SUCCESS",
+    )
+
+    return ProcessedItemResult(
+        index=index,
+        original_file_name=original_file_name or f"document{extension}",
+        output_file_name=output_file_name,
+        detected_type=detected_type,
+        pdf_bytes=pdf_bytes,
+        metadata={"detectedType": detected_type, **metadata},
+        response_headers={"Content-Disposition": f'attachment; filename="{output_file_name}"'},
+    )
+
+
+def build_batch_failure_result(
+    *,
+    index: int,
+    original_file_name: str,
+    output_file_name: str,
+    exc: ServiceError,
+) -> dict[str, Any]:
+    return {
+        "index": index,
+        "originalFileName": original_file_name,
+        "outputFileName": output_file_name,
+        "status": "failed",
+        "errorCode": exc.error_code,
+        "message": exc.message,
+        "technicalDetail": exc.technical_detail,
+    }
 
 
 @asynccontextmanager
@@ -789,6 +1357,109 @@ async def convert_html_to_pdf(payload: ConvertHtmlRequest, request: Request) -> 
     return await render_pdf_response(payload.html, file_name, request)
 
 
+@app.post("/convert/to-pdf")
+async def convert_to_pdf(request: Request, payload: dict[str, Any] = Body(...)) -> Response | JSONResponse:
+    items = normalize_universal_items(payload)
+
+    if len(items) == 1:
+        result = await process_universal_item(items[0], index=0, request=request)
+        return Response(
+            content=result.pdf_bytes,
+            media_type="application/pdf",
+            headers=result.response_headers,
+        )
+
+    request.state.file_name = f"batch-{len(items)}-items"
+    results: list[dict[str, Any]] = []
+    success_count = 0
+
+    for index, item in enumerate(items):
+        original_file_name = (
+            item.get("fileName") if isinstance(item, dict) and isinstance(item.get("fileName"), str) else f"item-{index + 1}"
+        )
+        output_file_name = build_pdf_filename(original_file_name, original_file_name)
+
+        try:
+            processed = await process_universal_item(item, index=index, request=request)
+            success_count += 1
+            results.append(
+                {
+                    "index": index,
+                    "originalFileName": processed.original_file_name,
+                    "outputFileName": processed.output_file_name,
+                    "status": "success",
+                    "contentType": "application/pdf",
+                    "contentBase64": base64.b64encode(processed.pdf_bytes).decode("ascii"),
+                    "metadata": processed.metadata,
+                }
+            )
+        except ServiceError as exc:
+            log_event(
+                logging.WARNING if exc.status_code < 500 else logging.ERROR,
+                "batch_item_failed",
+                traceId=request.state.trace_id,
+                index=index,
+                originalFileName=original_file_name,
+                errorCode=exc.error_code,
+                errorType=exc.error_type,
+                technicalDetail=exc.technical_detail,
+            )
+            results.append(
+                build_batch_failure_result(
+                    index=index,
+                    original_file_name=original_file_name,
+                    output_file_name=output_file_name,
+                    exc=exc,
+                )
+            )
+        except Exception as exc:
+            logger.exception(
+                json.dumps(
+                    {
+                        "timestamp": utc_timestamp(),
+                        "service": SERVICE_NAME,
+                        "event": "batch_item_unexpected_exception",
+                        "traceId": request.state.trace_id,
+                        "index": index,
+                        "originalFileName": original_file_name,
+                        "exceptionType": type(exc).__name__,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            results.append(
+                {
+                    "index": index,
+                    "originalFileName": original_file_name,
+                    "outputFileName": output_file_name,
+                    "status": "failed",
+                    "errorCode": "UNEXPECTED_SERVER_ERROR",
+                    "message": "Ocurrio un error inesperado procesando el documento.",
+                    "technicalDetail": "Controlled generic detail only.",
+                }
+            )
+
+    if success_count == len(items):
+        global_success: bool | str = True
+        request.state.final_status = "SUCCESS"
+    elif success_count == 0:
+        global_success = False
+        request.state.final_status = "BATCH_ALL_FAILED"
+    else:
+        global_success = "partial"
+        request.state.final_status = "BATCH_PARTIAL_SUCCESS"
+
+    request.state.file_name = f"batch-{len(items)}-items"
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": global_success,
+            "traceId": request.state.trace_id,
+            "results": results,
+        },
+    )
+
+
 @app.post("/convert/email-to-pdf")
 async def convert_email_to_pdf(
     request: Request,
@@ -840,8 +1511,14 @@ async def convert_email_to_pdf(
         metadata=metadata_payload,
     )
 
+    preview_html = build_email_preview_html(
+        original_file_name=uploaded_file_name,
+        ticket_id=str(metadata_payload.get("ticketId")) if metadata_payload.get("ticketId") is not None else None,
+        extracted_email=extracted_email,
+    )
+
     return await render_pdf_response(
-        extracted_email.html,
+        preview_html,
         request.state.file_name,
         request,
     )

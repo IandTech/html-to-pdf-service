@@ -1,37 +1,23 @@
 # html-to-pdf-service
 
-Servicio REST en Python para convertir HTML completo a PDF usando FastAPI + Playwright + Chromium, listo para desplegar en Render con Docker. Está pensado para flujos de Power Automate que envían el HTML completo de un correo Trade Ticket y necesitan un PDF visualmente fiel con imágenes, estilos, tablas, fondos y firmas.
+Servicio REST en Python para convertir HTML, correos `.eml/.msg` y documentos Office a PDF usando FastAPI + Playwright + Chromium. Para Word, Excel y PowerPoint usa LibreOffice headless dentro del contenedor. Esta pensado para flujos de Power Automate que envian uno o varios documentos y necesitan un PDF independiente por cada entrada.
 
-## Características
+## Caracteristicas
 
-- FastAPI async con endpoint de conversión binaria `application/pdf`
-- Renderizado real con Chromium headless vía Playwright
-- Espera de carga de recursos con `wait_until="networkidle"`
-- PDF A4 con fondos impresos y márgenes de 10mm
+- FastAPI async con endpoints binarios y batch JSON
+- Endpoint universal `POST /convert/to-pdf`
+- Renderizado HTML real con Chromium headless via Playwright
+- Conversion de `.doc/.docx`, `.xls/.xlsx`, `.ppt/.pptx` con LibreOffice
+- Soporte de correos `.eml` y `.msg`
+- Reutilizacion del motor existente de HTML a PDF
+- PDF A4 con fondos impresos y margenes de 10mm
 - Browser global en startup y cierre ordenado en shutdown
-- Una página aislada por request
-- Sin persistencia de archivos en disco
-- CORS básico habilitado
 - Logging estructurado en JSON
-- Errores explícitos con `traceId` para soporte operativo
-
-## Estructura del proyecto
-
-```text
-.
-├── .dockerignore
-├── Dockerfile
-├── README.md
-├── main.py
-├── render.yaml
-└── requirements.txt
-```
+- Errores explicitos con `traceId`
 
 ## Endpoints
 
 ### `GET /`
-
-Respuesta:
 
 ```json
 {
@@ -43,8 +29,6 @@ Respuesta:
 
 ### `GET /health`
 
-Respuesta:
-
 ```json
 {
   "status": "healthy",
@@ -54,6 +38,8 @@ Respuesta:
 ```
 
 ### `POST /convert/html-to-pdf`
+
+Mantiene compatibilidad con el endpoint original.
 
 Request:
 
@@ -71,61 +57,164 @@ Request:
 
 Respuesta exitosa:
 
+- `HTTP 200`
 - `Content-Type: application/pdf`
-- Body binario del PDF
-- Header `Content-Disposition: attachment; filename="trade-ticket.pdf"`
+- body binario PDF
+- `Content-Disposition` con el nombre final del PDF
 
-### `POST /convert/email-to-pdf`
+### `POST /convert/to-pdf`
 
-Endpoint único para convertir archivos `.eml` o `.msg` a PDF.
+Endpoint universal.
+
+Reglas fijas:
+
+- `1 documento de entrada = 1 PDF de salida`
+- multiples documentos de entrada = multiples PDFs independientes en JSON base64
+- nunca ZIP
+- nunca merge
+- nunca PDF combinado
+
+Tipos soportados:
+
+- HTML inline (`html`)
+- archivos `.html` y `.htm`
+- archivos `.txt`
+- correos `.eml`
+- correos `.msg`
+- `.doc` y `.docx`
+- `.xls` y `.xlsx`
+- `.ppt` y `.pptx`
+
+#### Single item
 
 Request:
 
-- `Content-Type: multipart/form-data`
-- Campo obligatorio `file`: archivo `.eml` o `.msg`
-- Campo opcional `fileName`: nombre de salida del PDF
-- Campo opcional `metadata`: JSON serializado como texto
+```json
+{
+  "fileName": "main-email.html",
+  "html": "<html><body><h1>Main email</h1></body></html>",
+  "metadata": {
+    "source": "PowerAutomate",
+    "ticketId": "20260519_131343_TT"
+  }
+}
+```
 
-Comportamiento:
+Respuesta:
 
-- extrae el cuerpo HTML si existe
-- si no existe HTML, usa el cuerpo de texto plano y lo convierte a HTML básico
-- intenta resolver imágenes inline `cid:` embebiéndolas como `data:`
-- reutiliza el mismo motor Chromium del endpoint HTML
+- `HTTP 200`
+- `Content-Type: application/pdf`
+- body binario PDF
+- `Content-Disposition` con nombre final `.pdf`
 
-## Variables de entorno opcionales
+#### Multiple items
 
-- `RENDER_TIMEOUT_MS`: timeout máximo en milisegundos para render y generación PDF. Default `30000`.
+Request:
+
+```json
+{
+  "items": [
+    {
+      "fileName": "main-email.html",
+      "html": "<html><body><h1>Main email</h1></body></html>",
+      "metadata": {
+        "source": "PowerAutomate",
+        "ticketId": "20260519_131343_TT"
+      }
+    },
+    {
+      "fileName": "correo-adjunto.eml",
+      "contentBase64": "BASE64_FILE",
+      "metadata": {
+        "source": "PowerAutomate",
+        "ticketId": "20260519_131343_TT"
+      }
+    }
+  ]
+}
+```
+
+Respuesta:
+
+```json
+{
+  "success": "partial",
+  "traceId": "global-trace-id",
+  "results": [
+    {
+      "index": 0,
+      "originalFileName": "main-email.html",
+      "outputFileName": "main-email.pdf",
+      "status": "success",
+      "contentType": "application/pdf",
+      "contentBase64": "BASE64_PDF",
+      "metadata": {
+        "detectedType": "html",
+        "source": "PowerAutomate"
+      }
+    },
+    {
+      "index": 1,
+      "originalFileName": "correo-adjunto.eml",
+      "outputFileName": "correo-adjunto.pdf",
+      "status": "failed",
+      "errorCode": "INVALID_BASE64",
+      "message": "El contenido recibido no es un Base64 valido.",
+      "technicalDetail": "Base64 decode failed."
+    }
+  ]
+}
+```
+
+Significado del campo `success`:
+
+- `true`: todos los documentos fueron exitosos
+- `partial`: algunos fueron exitosos y otros fallaron
+- `false`: todos fallaron
+
+### `POST /convert/email-to-pdf`
+
+Endpoint legado `multipart/form-data` para convertir un `.eml` o `.msg` individual.
+
+Campos:
+
+- `file`: archivo `.eml` o `.msg`
+- `fileName`: opcional
+- `metadata`: opcional, JSON serializado como texto
+
+## Variables de entorno
+
+- `RENDER_TIMEOUT_MS`: timeout maximo en milisegundos para render HTML y conversion Office. Default `30000`.
 - `LOG_LEVEL`: nivel de logging. Default `INFO`.
-- `STRICT_EXTERNAL_RESOURCES`: si es `true`, la API devuelve `422` cuando falla cualquier recurso externo. Default `false`.
+- `STRICT_EXTERNAL_RESOURCES`: si es `true`, la API devuelve `422` cuando falla cualquier recurso externo del HTML. Default `false`.
+- `LIBREOFFICE_BINARY`: binario de LibreOffice para conversion Office. Default `libreoffice`.
 
-## Ejecución local con Docker
+## Ejecucion local con Docker
 
-### 1. Construir imagen
+### Construir imagen
 
 ```bash
 docker build -t html-to-pdf-service .
 ```
 
-### 2. Ejecutar contenedor
+### Ejecutar contenedor
 
 ```bash
 docker run --rm -p 10000:10000 \
   -e RENDER_TIMEOUT_MS=30000 \
   -e LOG_LEVEL=INFO \
   -e STRICT_EXTERNAL_RESOURCES=false \
+  -e LIBREOFFICE_BINARY=libreoffice \
   html-to-pdf-service
 ```
 
-### 3. Probar salud
+### Probar health
 
 ```bash
 curl http://localhost:10000/health
 ```
 
-## Ejecución local sin Docker
-
-Si quieres correrlo fuera del contenedor de Render, instala dependencias y los browsers de Playwright:
+## Ejecucion local sin Docker
 
 ```bash
 pip install -r requirements.txt
@@ -133,13 +222,11 @@ playwright install chromium
 uvicorn main:app --host 0.0.0.0 --port 10000
 ```
 
-## Ejemplos `curl`
+Nota:
 
-### Health
+- Para conversion Office fuera de Docker necesitas tener LibreOffice instalado en el sistema y accesible desde `LIBREOFFICE_BINARY`.
 
-```bash
-curl http://localhost:10000/health
-```
+## Ejemplos curl
 
 ### Convertir HTML a PDF
 
@@ -148,26 +235,74 @@ curl -X POST http://localhost:10000/convert/html-to-pdf \
   -H "Content-Type: application/json" \
   --output trade-ticket.pdf \
   -d '{
-    "html": "<html><body style=\"font-family: Arial;\"><h1>Trade Ticket</h1><p>Processed from email.</p><img src=\"https://via.placeholder.com/300x80\"></body></html>",
+    "html": "<html><body><h1>Trade Ticket</h1><p>Processed from email.</p></body></html>",
     "fileName": "trade-ticket.pdf",
     "metadata": {
       "source": "PowerAutomate",
-      "ticketId": "TT-001",
-      "emailSubject": "Trade Ticket 001"
+      "ticketId": "TT-001"
     }
   }'
 ```
 
-### Convertir usando archivo JSON
+### Convertir `.eml` con endpoint universal
 
 ```bash
-curl -X POST http://localhost:10000/convert/html-to-pdf \
+curl -X POST http://localhost:10000/convert/to-pdf \
   -H "Content-Type: application/json" \
-  --output document.pdf \
-  --data @payload.json
+  --output correo.pdf \
+  -d '{
+    "fileName": "correo.eml",
+    "contentBase64": "BASE64_EML",
+    "metadata": {
+      "source": "PowerAutomate",
+      "ticketId": "TT-EMAIL-001"
+    }
+  }'
 ```
 
-### Convertir `.eml` o `.msg` a PDF
+### Convertir `.msg` con endpoint universal
+
+```bash
+curl -X POST http://localhost:10000/convert/to-pdf \
+  -H "Content-Type: application/json" \
+  --output correo-msg.pdf \
+  -d '{
+    "fileName": "correo.msg",
+    "contentBase64": "BASE64_MSG",
+    "metadata": {
+      "source": "PowerAutomate",
+      "ticketId": "TT-MSG-001"
+    }
+  }'
+```
+
+### Convertir multiples documentos a PDFs independientes
+
+```bash
+curl -X POST http://localhost:10000/convert/to-pdf \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [
+      {
+        "fileName": "main-email.html",
+        "html": "<html><body><h1>Main email</h1></body></html>",
+        "metadata": { "source": "PowerAutomate" }
+      },
+      {
+        "fileName": "correo-adjunto.msg",
+        "contentBase64": "BASE64_MSG",
+        "metadata": { "source": "PowerAutomate" }
+      },
+      {
+        "fileName": "documento.xlsx",
+        "contentBase64": "BASE64_XLSX",
+        "metadata": { "source": "PowerAutomate" }
+      }
+    ]
+  }'
+```
+
+### Endpoint legado multipart para `.eml` o `.msg`
 
 ```bash
 curl -X POST http://localhost:10000/convert/email-to-pdf \
@@ -179,17 +314,17 @@ curl -X POST http://localhost:10000/convert/email-to-pdf \
 
 ## Ejemplo Power Automate
 
-Usa una acción HTTP con esta configuración:
+### Single item HTML
 
-- Método: `POST`
-- URL: `https://<tu-servicio-render>/convert/html-to-pdf`
+- Method: `POST`
+- URL: `https://<tu-servicio>/convert/to-pdf`
 - Headers: `Content-Type: application/json`
 - Body:
 
 ```json
 {
+  "fileName": "trade-ticket-@{utcNow('yyyyMMdd-HHmmss')}.html",
   "html": "@{triggerOutputs()?['body/body']}",
-  "fileName": "trade-ticket-@{utcNow('yyyyMMdd-HHmmss')}.pdf",
   "metadata": {
     "source": "PowerAutomate",
     "ticketId": "@{variables('ticketId')}",
@@ -198,169 +333,124 @@ Usa una acción HTTP con esta configuración:
 }
 ```
 
-Si luego necesitas adjuntar o guardar el PDF, consume el body binario de la respuesta HTTP en el siguiente paso del flujo.
-
-## Despliegue en Render
-
-### Opción 1. Desde GitHub con Dockerfile
-
-1. Sube este proyecto a GitHub.
-2. En Render crea un nuevo `Web Service`.
-3. Conecta el repositorio.
-4. Render detectará el `Dockerfile`.
-5. Configura variables si quieres ajustar timeout o nivel de logs:
-   - `RENDER_TIMEOUT_MS=30000`
-   - `LOG_LEVEL=INFO`
-   - `STRICT_EXTERNAL_RESOURCES=false`
-6. Usa `/health` como health check.
-
-### Opción 2. Usando `render.yaml`
-
-Render puede aprovisionar el servicio automáticamente al detectar el archivo [`render.yaml`](/C:/TradeTicket_API/render.yaml).
-
-## Errores posibles
-
-Todos los errores devuelven JSON estructurado con `traceId`:
+### Single item attachment `.eml` o `.msg`
 
 ```json
 {
-  "success": false,
-  "errorCode": "HTML_EMPTY",
-  "errorType": "ValidationError",
-  "message": "The HTML content received is empty.",
-  "technicalDetail": "Request body html property was null or blank.",
-  "timestamp": "2026-05-18T20:00:00Z",
-  "traceId": "uuid-generated-id"
-}
-```
-
-### `HTML_EMPTY` - HTTP 400
-
-Se devuelve cuando `html` llega `null`, vacío o solo con espacios.
-
-### `INVALID_HTML` - HTTP 400
-
-Se devuelve cuando `html` no es string o no contiene markup HTML detectable.
-
-### `PDF_RENDER_TIMEOUT` - HTTP 408
-
-Se devuelve cuando Chromium excede el timeout configurado durante `set_content` o `pdf()`.
-
-### `EXTERNAL_RESOURCE_LOAD_FAILED` - HTTP 422
-
-Se devuelve cuando Playwright detecta uno o más recursos externos fallidos y `STRICT_EXTERNAL_RESOURCES=true`. La respuesta incluye:
-
-```json
-{
-  "details": {
-    "failedResourceCount": 2,
-    "failedResources": [
-      {
-        "url": "https://example.com/logo.png",
-        "method": "GET",
-        "resourceType": "image",
-        "errorText": "net::ERR_NAME_NOT_RESOLVED"
-      }
-    ]
+  "fileName": "@{items('Apply_to_each')?['Name']}",
+  "contentBase64": "@{body('Get_attachment_content')?['$content']}",
+  "metadata": {
+    "source": "PowerAutomate",
+    "ticketId": "@{variables('ticketId')}",
+    "emailSubject": "@{triggerOutputs()?['body/subject']}"
   }
 }
 ```
 
-### `BROWSER_RENDER_ERROR` - HTTP 500
+### Multiple items
 
-Se devuelve cuando Playwright o Chromium fallan al renderizar el documento.
+Construye un arreglo `items` y envialo al mismo endpoint. Cuando la respuesta sea JSON, cada resultado exitoso trae su propio `contentBase64`.
 
-### `EMAIL_FILE_EMPTY` - HTTP 400
+## Despliegue en Railway
 
-Se devuelve cuando se sube un `.eml` o `.msg` vacío.
+1. Sube el proyecto a GitHub.
+2. Conecta el repo en Railway.
+3. Railway detecta el `Dockerfile`.
+4. Configura variables si quieres ajustar timeout o logs:
+   - `RENDER_TIMEOUT_MS=30000`
+   - `LOG_LEVEL=INFO`
+   - `STRICT_EXTERNAL_RESOURCES=false`
+   - `LIBREOFFICE_BINARY=libreoffice`
+5. Usa `/health` como health check.
 
-### `UNSUPPORTED_EMAIL_FILE_TYPE` - HTTP 415
+## Errores principales
 
-Se devuelve cuando el archivo enviado no termina en `.eml` o `.msg`.
+Todos los errores devuelven JSON estructurado con `traceId`.
 
-### `EMAIL_CONTENT_EXTRACTION_FAILED` - HTTP 422
+### `HTML_EMPTY` - HTTP 400
 
-Se devuelve cuando la API no puede parsear el archivo de correo.
+El campo `html` llego vacio o nulo.
+
+### `INVALID_HTML` - HTTP 400
+
+El payload HTML no pudo procesarse.
+
+### `EMPTY_FILE` - HTTP 400
+
+`contentBase64` llego vacio, nulo o decodifico a cero bytes.
+
+### `INVALID_BASE64` - HTTP 400
+
+El contenido recibido no es un Base64 valido.
+
+### `UNSUPPORTED_EXTENSION` - HTTP 400
+
+La extension del documento no es soportada por el endpoint universal.
 
 ### `EMAIL_BODY_NOT_FOUND` - HTTP 422
 
-Se devuelve cuando el archivo sí se pudo abrir, pero no contiene cuerpo HTML ni texto plano renderizable.
+No se encontro cuerpo HTML ni texto plano renderizable dentro del correo.
 
-### `INVALID_METADATA` - HTTP 400
+### `MSG_PARSE_FAILED` - HTTP 422
 
-Se devuelve cuando el campo `metadata` del multipart no es JSON válido o no es un objeto JSON.
+`extract-msg` no pudo procesar el archivo `.msg`.
+
+### `OFFICE_CONVERSION_FAILED` - HTTP 422
+
+LibreOffice no pudo convertir el documento Office a PDF.
+
+### `OFFICE_CONVERSION_UNAVAILABLE` - HTTP 500
+
+LibreOffice no esta disponible en el entorno actual.
+
+### `EXTERNAL_RESOURCE_LOAD_FAILED` - HTTP 422
+
+Chromium detecto recursos externos fallidos y `STRICT_EXTERNAL_RESOURCES=true`.
+
+### `PDF_RENDER_TIMEOUT` - HTTP 408
+
+La generacion del PDF excedio el timeout configurado.
 
 ### `UNEXPECTED_SERVER_ERROR` - HTTP 500
 
-Se devuelve ante una excepción no controlada. El stack trace queda solo en logs internos y el cliente recibe un `traceId`.
+Ocurrio un error inesperado. El stack trace completo queda solo en logs internos.
 
 ## Logging esperado
 
-Cada request genera logs JSON útiles para debugging, auditoría y soporte:
+Cada request genera logs JSON utiles para debugging, auditoria y soporte:
 
 - `traceId`
-- path y método
-- tiempo de procesamiento
-- tamaño del HTML recibido en bytes
-- nombre final del archivo PDF
+- path y metodo
+- tamano del HTML o archivo procesado
+- `fileName`
+- extension detectada
+- metadata recibida
+- tiempo de parseo por documento
+- tiempo de render por documento
 - cantidad de recursos externos detectados
 - cantidad de recursos fallidos
 - status final del request
-- formato de archivo fuente cuando se usa `.eml` o `.msg`
-
-Cuando `STRICT_EXTERNAL_RESOURCES=false`, los recursos externos fallidos se registran como advertencia no fatal. En ese caso:
-
-- la API sigue devolviendo `200` con el PDF
-- se agregan headers `X-External-Resources-Status: warning` y `X-Failed-Resource-Count`
-- el status final en logs será `SUCCESS_WITH_RESOURCE_WARNINGS`
-
-Ejemplo:
-
-```json
-{
-  "timestamp": "2026-05-19T14:00:00Z",
-  "service": "html-to-pdf-service",
-  "event": "request_completed",
-  "traceId": "6c1f2d10-6f0f-4ff0-99b1-f2992ed58083",
-  "method": "POST",
-  "path": "/convert/html-to-pdf",
-  "statusCode": 200,
-  "processingTimeMs": 842.51,
-  "htmlSizeBytes": 19428,
-  "fileName": "trade-ticket.pdf",
-  "externalResourceCount": 4,
-  "failedResourceCount": 0,
-  "finalStatus": "SUCCESS"
-}
-```
 
 ## Troubleshooting
 
-### El health check falla en Render
+### El PDF sale sin algunas imagenes
 
-- Verifica que Render esté exponiendo el puerto `10000` o que la variable `PORT` se esté inyectando correctamente.
-- Revisa los logs de startup para confirmar el evento `browser_started`.
+- Verifica que las URLs externas sean accesibles desde Internet.
+- Si `STRICT_EXTERNAL_RESOURCES=false`, revisa headers `X-External-Resources-Status` y `X-Failed-Resource-Count`.
+- Para correos con imagenes inline, la API intenta resolver `cid:` a `data:` cuando es posible.
 
-### El PDF sale sin imágenes o estilos
+### Un `.msg` falla pero el texto existe
 
-- Verifica que las URLs externas sean accesibles desde Internet y no requieran autenticación.
-- Si `STRICT_EXTERNAL_RESOURCES=true`, revisa si la respuesta fue `422 EXTERNAL_RESOURCE_LOAD_FAILED`.
-- Si `STRICT_EXTERNAL_RESOURCES=false`, revisa los headers `X-External-Resources-Status` y `X-Failed-Resource-Count`.
-- Confirma que el HTML entregue URLs absolutas `https://`.
+- Revisa logs por `MSG_PARSE_FAILED`.
+- Si el `.msg` no expone HTML, la API intenta usar el cuerpo de texto plano.
 
-### El proceso tarda demasiado
+### Un Office file no convierte
 
-- Aumenta `RENDER_TIMEOUT_MS`.
-- Reduce recursos externos pesados o HTML excesivamente grande.
+- Revisa `OFFICE_CONVERSION_FAILED`.
+- Busca detalles del filtro o formato en logs.
+- Confirma que el archivo no esta corrupto.
 
-### El servicio responde 500
+### El endpoint batch devolvio `partial`
 
-- Busca el `traceId` en los logs.
-- Revisa si el error fue `BROWSER_RENDER_ERROR` o `UNEXPECTED_SERVER_ERROR`.
-
-## Notas operativas
-
-- No se usa autenticación en esta primera versión.
-- No se guardan archivos permanentemente en disco.
-- El nombre del PDF se sanea para evitar caracteres problemáticos.
-- El servicio devuelve `X-Trace-Id` en la respuesta para correlacionar con logs.
+- Algunos documentos se convirtieron bien y otros fallaron.
+- Revisa cada item en `results` y usa solo los que tengan `status: success`.
