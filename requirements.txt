@@ -1,3 +1,5 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
 playwright==1.59.0
+python-multipart==0.0.20
+extract-msg==0.55.0

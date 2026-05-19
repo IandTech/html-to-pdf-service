@@ -75,6 +75,24 @@ Respuesta exitosa:
 - Body binario del PDF
 - Header `Content-Disposition: attachment; filename="trade-ticket.pdf"`
 
+### `POST /convert/email-to-pdf`
+
+Endpoint único para convertir archivos `.eml` o `.msg` a PDF.
+
+Request:
+
+- `Content-Type: multipart/form-data`
+- Campo obligatorio `file`: archivo `.eml` o `.msg`
+- Campo opcional `fileName`: nombre de salida del PDF
+- Campo opcional `metadata`: JSON serializado como texto
+
+Comportamiento:
+
+- extrae el cuerpo HTML si existe
+- si no existe HTML, usa el cuerpo de texto plano y lo convierte a HTML básico
+- intenta resolver imágenes inline `cid:` embebiéndolas como `data:`
+- reutiliza el mismo motor Chromium del endpoint HTML
+
 ## Variables de entorno opcionales
 
 - `RENDER_TIMEOUT_MS`: timeout máximo en milisegundos para render y generación PDF. Default `30000`.
@@ -147,6 +165,16 @@ curl -X POST http://localhost:10000/convert/html-to-pdf \
   -H "Content-Type: application/json" \
   --output document.pdf \
   --data @payload.json
+```
+
+### Convertir `.eml` o `.msg` a PDF
+
+```bash
+curl -X POST http://localhost:10000/convert/email-to-pdf \
+  -F "file=@correo.eml" \
+  -F "fileName=correo-renderizado.pdf" \
+  -F "metadata={\"source\":\"Postman\",\"ticketId\":\"TT-EMAIL-001\"}" \
+  --output correo-renderizado.pdf
 ```
 
 ## Ejemplo Power Automate
@@ -242,6 +270,26 @@ Se devuelve cuando Playwright detecta uno o más recursos externos fallidos y `S
 
 Se devuelve cuando Playwright o Chromium fallan al renderizar el documento.
 
+### `EMAIL_FILE_EMPTY` - HTTP 400
+
+Se devuelve cuando se sube un `.eml` o `.msg` vacío.
+
+### `UNSUPPORTED_EMAIL_FILE_TYPE` - HTTP 415
+
+Se devuelve cuando el archivo enviado no termina en `.eml` o `.msg`.
+
+### `EMAIL_CONTENT_EXTRACTION_FAILED` - HTTP 422
+
+Se devuelve cuando la API no puede parsear el archivo de correo.
+
+### `EMAIL_BODY_NOT_FOUND` - HTTP 422
+
+Se devuelve cuando el archivo sí se pudo abrir, pero no contiene cuerpo HTML ni texto plano renderizable.
+
+### `INVALID_METADATA` - HTTP 400
+
+Se devuelve cuando el campo `metadata` del multipart no es JSON válido o no es un objeto JSON.
+
 ### `UNEXPECTED_SERVER_ERROR` - HTTP 500
 
 Se devuelve ante una excepción no controlada. El stack trace queda solo en logs internos y el cliente recibe un `traceId`.
@@ -258,6 +306,7 @@ Cada request genera logs JSON útiles para debugging, auditoría y soporte:
 - cantidad de recursos externos detectados
 - cantidad de recursos fallidos
 - status final del request
+- formato de archivo fuente cuando se usa `.eml` o `.msg`
 
 Cuando `STRICT_EXTERNAL_RESOURCES=false`, los recursos externos fallidos se registran como advertencia no fatal. En ese caso:
 

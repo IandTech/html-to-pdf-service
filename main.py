@@ -1,16 +1,24 @@
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from email import policy
+from email.parser import BytesParser
+from html import escape as html_escape
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request, Response
+import extract_msg
+from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -85,6 +93,13 @@ class ConvertHtmlRequest(BaseModel):
     html: Any = None
     fileName: str | None = None
     metadata: dict[str, Any] | None = Field(default_factory=dict)
+
+
+@dataclass
+class ExtractedEmailContent:
+    html: str
+    subject: str | None
+    source_format: str
 
 
 class ServiceError(Exception):
@@ -177,6 +192,18 @@ def sanitize_filename(file_name: str | None) -> str:
     return cleaned[:180]
 
 
+def build_pdf_filename(preferred_file_name: str | None, source_name: str | None = None) -> str:
+    if preferred_file_name:
+        return sanitize_filename(preferred_file_name)
+
+    if source_name:
+        source_stem = Path(source_name).stem.strip()
+        if source_stem:
+            return sanitize_filename(f"{source_stem}.pdf")
+
+    return DEFAULT_FILE_NAME
+
+
 def validate_html_payload(html: Any) -> str:
     if html is None:
         raise ServiceError(
@@ -231,6 +258,214 @@ def validate_html_payload(html: Any) -> str:
     return html_text
 
 
+def decode_bytes_to_text(payload: bytes | str | None) -> str | None:
+    if payload is None:
+        return None
+    if isinstance(payload, str):
+        return payload
+
+    for encoding in ("utf-8", "utf-16", "cp1252", "latin-1"):
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return payload.decode("utf-8", errors="replace")
+
+
+def normalize_content_id(content_id: str | None) -> str | None:
+    if not content_id:
+        return None
+
+    normalized = content_id.strip().strip("<>").strip()
+    if normalized.lower().startswith("cid:"):
+        normalized = normalized[4:]
+    return normalized or None
+
+
+def build_data_url(resource_bytes: bytes, mime_type: str | None) -> str:
+    resolved_mime_type = mime_type or "application/octet-stream"
+    encoded = base64.b64encode(resource_bytes).decode("ascii")
+    return f"data:{resolved_mime_type};base64,{encoded}"
+
+
+def embed_inline_resources(html: str, inline_resources: dict[str, dict[str, Any]]) -> str:
+    if not inline_resources:
+        return html
+
+    def replace_cid(match: re.Match[str]) -> str:
+        content_id = normalize_content_id(match.group(1))
+        resource = inline_resources.get(content_id or "")
+        if not resource:
+            return match.group(0)
+        return build_data_url(resource["data"], resource.get("mimeType"))
+
+    return re.sub(r"cid:([^\"' >)]+)", replace_cid, html, flags=re.IGNORECASE)
+
+
+def text_to_html_document(text: str) -> str:
+    escaped_text = html_escape(text or "")
+    body_html = escaped_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+    return (
+        "<html><body style=\"font-family: Arial, sans-serif; white-space: normal;\">"
+        f"{body_html}"
+        "</body></html>"
+    )
+
+
+def extract_email_content(file_bytes: bytes, file_name: str | None) -> ExtractedEmailContent:
+    suffix = Path(file_name or "").suffix.lower()
+
+    if not file_bytes:
+        raise ServiceError(
+            status_code=400,
+            error_code="EMAIL_FILE_EMPTY",
+            error_type="ValidationError",
+            message="The email file received is empty.",
+            technical_detail="Uploaded .eml or .msg file contained zero bytes.",
+        )
+
+    if suffix == ".eml":
+        return extract_eml_content(file_bytes)
+    if suffix == ".msg":
+        return extract_msg_content(file_bytes)
+
+    raise ServiceError(
+        status_code=415,
+        error_code="UNSUPPORTED_EMAIL_FILE_TYPE",
+        error_type="ValidationError",
+        message="The uploaded email file type is not supported.",
+        technical_detail="Supported file types are .eml and .msg.",
+        details={"receivedFileName": file_name},
+    )
+
+
+def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
+    try:
+        message = BytesParser(policy=policy.default).parsebytes(file_bytes)
+    except Exception as exc:
+        raise ServiceError(
+            status_code=422,
+            error_code="EMAIL_CONTENT_EXTRACTION_FAILED",
+            error_type="EmailParsingError",
+            message="The email file could not be processed.",
+            technical_detail=f"Python email parser failed to read the .eml file: {exc}",
+        ) from exc
+
+    html_body: str | None = None
+    plain_body: str | None = None
+    inline_resources: dict[str, dict[str, Any]] = {}
+
+    preferred_html = message.get_body(preferencelist=("html",))
+    if preferred_html is not None:
+        html_body = preferred_html.get_content()
+
+    preferred_plain = message.get_body(preferencelist=("plain",))
+    if preferred_plain is not None:
+        plain_body = preferred_plain.get_content()
+
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+
+        content_type = part.get_content_type()
+        content_id = normalize_content_id(part.get("Content-ID"))
+        payload = part.get_payload(decode=True) or b""
+
+        if content_id and payload:
+            inline_resources[content_id] = {
+                "data": payload,
+                "mimeType": content_type,
+            }
+
+        if html_body is None and content_type == "text/html":
+            html_body = part.get_content()
+        elif plain_body is None and content_type == "text/plain":
+            plain_body = part.get_content()
+
+    if not html_body and plain_body:
+        html_body = text_to_html_document(plain_body)
+
+    if not html_body:
+        raise ServiceError(
+            status_code=422,
+            error_code="EMAIL_BODY_NOT_FOUND",
+            error_type="EmailParsingError",
+            message="The email file does not contain renderable content.",
+            technical_detail="No HTML body or plain text body could be extracted from the .eml file.",
+        )
+
+    return ExtractedEmailContent(
+        html=embed_inline_resources(html_body, inline_resources),
+        subject=message.get("Subject"),
+        source_format="eml",
+    )
+
+
+def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
+    msg = None
+    try:
+        msg = extract_msg.Message(file_bytes)
+        html_body = decode_bytes_to_text(getattr(msg, "htmlBody", None))
+        plain_body = getattr(msg, "body", None)
+        inline_resources: dict[str, dict[str, Any]] = {}
+
+        for attachment in getattr(msg, "attachments", []):
+            content_id = normalize_content_id(
+                getattr(attachment, "cid", None) or getattr(attachment, "contentId", None)
+            )
+            attachment_data = getattr(attachment, "data", None)
+
+            if not content_id or not isinstance(attachment_data, bytes):
+                continue
+
+            attachment_name = (
+                getattr(attachment, "name", None)
+                or getattr(attachment, "longFilename", None)
+                or getattr(attachment, "shortFilename", None)
+                or ""
+            )
+            mime_type = getattr(attachment, "mimetype", None) or mimetypes.guess_type(attachment_name)[0]
+            inline_resources[content_id] = {
+                "data": attachment_data,
+                "mimeType": mime_type or "application/octet-stream",
+            }
+
+        if not html_body and plain_body:
+            html_body = text_to_html_document(plain_body)
+
+        if not html_body:
+            raise ServiceError(
+                status_code=422,
+                error_code="EMAIL_BODY_NOT_FOUND",
+                error_type="EmailParsingError",
+                message="The email file does not contain renderable content.",
+                technical_detail="No HTML body or plain text body could be extracted from the .msg file.",
+            )
+
+        return ExtractedEmailContent(
+            html=embed_inline_resources(html_body, inline_resources),
+            subject=getattr(msg, "subject", None),
+            source_format="msg",
+        )
+    except ServiceError:
+        raise
+    except Exception as exc:
+        raise ServiceError(
+            status_code=422,
+            error_code="EMAIL_CONTENT_EXTRACTION_FAILED",
+            error_type="EmailParsingError",
+            message="The email file could not be processed.",
+            technical_detail=f"extract-msg failed to read the .msg file: {exc}",
+        ) from exc
+    finally:
+        if msg is not None:
+            try:
+                msg.close()
+            except Exception:
+                pass
+
+
 def extract_external_resource_urls(html: str) -> list[str]:
     patterns = [
         r"""(?:src|href|poster)\s*=\s*["'](https?://[^"' >]+)["']""",
@@ -248,6 +483,123 @@ async def create_page(browser: Browser) -> tuple[BrowserContext, Page]:
     page = await context.new_page()
     page.set_default_timeout(settings.render_timeout_ms)
     return context, page
+
+
+async def render_pdf_response(html: str, file_name: str, request: Request) -> Response:
+    html = validate_html_payload(html)
+    external_urls = extract_external_resource_urls(html)
+
+    request.state.file_name = file_name
+    request.state.html_size = len(html.encode("utf-8"))
+    request.state.external_resource_count = len(external_urls)
+
+    if browser_manager.browser is None:
+        raise ServiceError(
+            status_code=500,
+            error_code="BROWSER_RENDER_ERROR",
+            error_type="BrowserError",
+            message="The browser engine failed while rendering the document.",
+            technical_detail="Chromium browser instance is not available.",
+        )
+
+    context: BrowserContext | None = None
+    page: Page | None = None
+    failed_resources: list[dict[str, Any]] = []
+
+    try:
+        context, page = await create_page(browser_manager.browser)
+
+        def on_request_failed(failed_request) -> None:
+            failure_text = failed_request.failure or "Unknown request failure"
+            failed_resources.append(
+                {
+                    "url": failed_request.url,
+                    "method": failed_request.method,
+                    "resourceType": failed_request.resource_type,
+                    "errorText": failure_text,
+                }
+            )
+
+        page.on("requestfailed", on_request_failed)
+
+        try:
+            await page.set_content(html, wait_until="networkidle", timeout=settings.render_timeout_ms)
+            pdf_bytes = await asyncio.wait_for(
+                page.pdf(
+                    format="A4",
+                    print_background=True,
+                    margin={
+                        "top": "10mm",
+                        "right": "10mm",
+                        "bottom": "10mm",
+                        "left": "10mm",
+                    },
+                ),
+                timeout=settings.render_timeout_ms / 1000,
+            )
+        except (PlaywrightTimeoutError, asyncio.TimeoutError) as exc:
+            raise ServiceError(
+                status_code=408,
+                error_code="PDF_RENDER_TIMEOUT",
+                error_type="TimeoutError",
+                message="The PDF rendering process exceeded the allowed timeout.",
+                technical_detail=f"Chromium exceeded the configured timeout of {settings.render_timeout_ms}ms.",
+            ) from exc
+        except PlaywrightError as exc:
+            raise ServiceError(
+                status_code=500,
+                error_code="BROWSER_RENDER_ERROR",
+                error_type="BrowserError",
+                message="The browser engine failed while rendering the document.",
+                technical_detail=str(exc),
+            ) from exc
+
+        if failed_resources:
+            request.state.failed_resource_count = len(failed_resources)
+            failed_resource_details = {
+                "failedResourceCount": len(failed_resources),
+                "failedResources": failed_resources,
+            }
+
+            if settings.strict_external_resources:
+                raise ServiceError(
+                    status_code=422,
+                    error_code="EXTERNAL_RESOURCE_LOAD_FAILED",
+                    error_type="ExternalResourceError",
+                    message="One or more external resources could not be loaded.",
+                    technical_detail="Chromium reported network failures while loading external resources.",
+                    details=failed_resource_details,
+                )
+
+            request.state.final_status = "SUCCESS_WITH_RESOURCE_WARNINGS"
+            log_event(
+                logging.WARNING,
+                "external_resources_failed_nonfatal",
+                traceId=request.state.trace_id,
+                fileName=file_name,
+                failedResourceCount=len(failed_resources),
+                failedResources=failed_resources,
+            )
+
+        if not failed_resources:
+            request.state.failed_resource_count = 0
+            request.state.final_status = "SUCCESS"
+
+        response_headers = {"Content-Disposition": f'attachment; filename="{file_name}"'}
+        if failed_resources and not settings.strict_external_resources:
+            response_headers["X-External-Resources-Status"] = "warning"
+            response_headers["X-Failed-Resource-Count"] = str(len(failed_resources))
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers=response_headers,
+        )
+    finally:
+        if page is not None:
+            await page.close()
+        if context is not None:
+            await context.close()
 
 
 @asynccontextmanager
@@ -433,118 +785,63 @@ async def favicon() -> Response:
 
 @app.post("/convert/html-to-pdf")
 async def convert_html_to_pdf(payload: ConvertHtmlRequest, request: Request) -> Response:
-    html = validate_html_payload(payload.html)
-    file_name = sanitize_filename(payload.fileName)
-    external_urls = extract_external_resource_urls(html)
+    file_name = build_pdf_filename(payload.fileName)
+    return await render_pdf_response(payload.html, file_name, request)
 
-    request.state.file_name = file_name
-    request.state.html_size = len(html.encode("utf-8"))
-    request.state.external_resource_count = len(external_urls)
 
-    if browser_manager.browser is None:
-        raise ServiceError(
-            status_code=500,
-            error_code="BROWSER_RENDER_ERROR",
-            error_type="BrowserError",
-            message="The browser engine failed while rendering the document.",
-            technical_detail="Chromium browser instance is not available.",
-        )
+@app.post("/convert/email-to-pdf")
+async def convert_email_to_pdf(
+    request: Request,
+    file: UploadFile = File(...),
+    fileName: str | None = Form(default=None),
+    metadata: str | None = Form(default=None),
+) -> Response:
+    uploaded_file_name = file.filename or "email-message"
+    request.state.file_name = build_pdf_filename(fileName, uploaded_file_name)
 
-    context: BrowserContext | None = None
-    page: Page | None = None
-    failed_resources: list[dict[str, Any]] = []
+    metadata_payload: dict[str, Any] = {}
+    if metadata:
+        try:
+            parsed_metadata = json.loads(metadata)
+        except json.JSONDecodeError as exc:
+            raise ServiceError(
+                status_code=400,
+                error_code="INVALID_METADATA",
+                error_type="ValidationError",
+                message="The metadata payload could not be processed.",
+                technical_detail=f"metadata form field must be valid JSON: {exc}",
+            ) from exc
+
+        if not isinstance(parsed_metadata, dict):
+            raise ServiceError(
+                status_code=400,
+                error_code="INVALID_METADATA",
+                error_type="ValidationError",
+                message="The metadata payload could not be processed.",
+                technical_detail="metadata form field must be a JSON object.",
+            )
+        metadata_payload = parsed_metadata
 
     try:
-        context, page = await create_page(browser_manager.browser)
-
-        def on_request_failed(failed_request) -> None:
-            failure_text = failed_request.failure or "Unknown request failure"
-            failed_resources.append(
-                {
-                    "url": failed_request.url,
-                    "method": failed_request.method,
-                    "resourceType": failed_request.resource_type,
-                    "errorText": failure_text,
-                }
-            )
-
-        page.on("requestfailed", on_request_failed)
-
-        try:
-            await page.set_content(html, wait_until="networkidle", timeout=settings.render_timeout_ms)
-            pdf_bytes = await asyncio.wait_for(
-                page.pdf(
-                    format="A4",
-                    print_background=True,
-                    margin={
-                        "top": "10mm",
-                        "right": "10mm",
-                        "bottom": "10mm",
-                        "left": "10mm",
-                    },
-                ),
-                timeout=settings.render_timeout_ms / 1000,
-            )
-        except (PlaywrightTimeoutError, asyncio.TimeoutError) as exc:
-            raise ServiceError(
-                status_code=408,
-                error_code="PDF_RENDER_TIMEOUT",
-                error_type="TimeoutError",
-                message="The PDF rendering process exceeded the allowed timeout.",
-                technical_detail=f"Chromium exceeded the configured timeout of {settings.render_timeout_ms}ms.",
-            ) from exc
-        except PlaywrightError as exc:
-            raise ServiceError(
-                status_code=500,
-                error_code="BROWSER_RENDER_ERROR",
-                error_type="BrowserError",
-                message="The browser engine failed while rendering the document.",
-                technical_detail=str(exc),
-            ) from exc
-
-        if failed_resources:
-            request.state.failed_resource_count = len(failed_resources)
-            failed_resource_details = {
-                "failedResourceCount": len(failed_resources),
-                "failedResources": failed_resources,
-            }
-
-            if settings.strict_external_resources:
-                raise ServiceError(
-                    status_code=422,
-                    error_code="EXTERNAL_RESOURCE_LOAD_FAILED",
-                    error_type="ExternalResourceError",
-                    message="One or more external resources could not be loaded.",
-                    technical_detail="Chromium reported network failures while loading external resources.",
-                    details=failed_resource_details,
-                )
-
-            request.state.final_status = "SUCCESS_WITH_RESOURCE_WARNINGS"
-            log_event(
-                logging.WARNING,
-                "external_resources_failed_nonfatal",
-                traceId=request.state.trace_id,
-                fileName=file_name,
-                failedResourceCount=len(failed_resources),
-                failedResources=failed_resources,
-            )
-
-        if not failed_resources:
-            request.state.failed_resource_count = 0
-            request.state.final_status = "SUCCESS"
-
-        response_headers = {"Content-Disposition": f'attachment; filename="{file_name}"'}
-        if failed_resources and not settings.strict_external_resources:
-            response_headers["X-External-Resources-Status"] = "warning"
-            response_headers["X-Failed-Resource-Count"] = str(len(failed_resources))
-
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers=response_headers,
-        )
+        file_bytes = await file.read()
     finally:
-        if page is not None:
-            await page.close()
-        if context is not None:
-            await context.close()
+        await file.close()
+
+    extracted_email = extract_email_content(file_bytes, uploaded_file_name)
+
+    log_event(
+        logging.INFO,
+        "email_file_extracted",
+        traceId=request.state.trace_id,
+        uploadedFileName=uploaded_file_name,
+        uploadedFileSizeBytes=len(file_bytes),
+        sourceFormat=extracted_email.source_format,
+        extractedSubject=extracted_email.subject,
+        metadata=metadata_payload,
+    )
+
+    return await render_pdf_response(
+        extracted_email.html,
+        request.state.file_name,
+        request,
+    )
