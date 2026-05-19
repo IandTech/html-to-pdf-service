@@ -454,18 +454,20 @@ async def convert_html_to_pdf(payload: ConvertHtmlRequest, request: Request) -> 
 
         try:
             await page.set_content(html, wait_until="networkidle", timeout=settings.render_timeout_ms)
-            pdf_bytes = await page.pdf(
-                format="A4",
-                print_background=True,
-                margin={
-                    "top": "10mm",
-                    "right": "10mm",
-                    "bottom": "10mm",
-                    "left": "10mm",
-                },
-                timeout=settings.render_timeout_ms,
+            pdf_bytes = await asyncio.wait_for(
+                page.pdf(
+                    format="A4",
+                    print_background=True,
+                    margin={
+                        "top": "10mm",
+                        "right": "10mm",
+                        "bottom": "10mm",
+                        "left": "10mm",
+                    },
+                ),
+                timeout=settings.render_timeout_ms / 1000,
             )
-        except PlaywrightTimeoutError as exc:
+        except (PlaywrightTimeoutError, asyncio.TimeoutError) as exc:
             raise ServiceError(
                 status_code=408,
                 error_code="PDF_RENDER_TIMEOUT",
