@@ -79,6 +79,7 @@ Tipos soportados:
 - HTML inline (`html`)
 - archivos `.html` y `.htm`
 - archivos `.txt`
+- archivos `.pdf`
 - correos `.eml`
 - correos `.msg`
 - `.doc` y `.docx`
@@ -398,21 +399,29 @@ El item no incluye `html` ni `contentBase64`.
 
 El item incluye `html` y `contentBase64` al mismo tiempo.
 
-### `UNSUPPORTED_EXTENSION` - HTTP 400
+### `UNSUPPORTED_FILE_TYPE` - HTTP 400
 
 La extension del documento no es soportada por el endpoint universal.
+
+### `EML_PARSE_FAILED` - HTTP 422
+
+No se pudo parsear correctamente el archivo `.eml`.
+
+### `MSG_PARSE_FAILED` - HTTP 422
+
+No se pudo parsear correctamente el archivo `.msg`.
 
 ### `EMAIL_BODY_NOT_FOUND` - HTTP 422
 
 No se encontro cuerpo HTML ni texto plano renderizable dentro del correo.
 
-### `EMAIL_PARSE_FAILED` - HTTP 422
-
-No se pudo parsear correctamente el archivo `.eml` o `.msg`.
-
 ### `EMAIL_INLINE_IMAGE_WARNING`
 
 No rompe la conversion. Se registra en logs cuando una o mas imagenes inline `cid:` no pudieron resolverse.
+
+### `EMAIL_RENDER_FAILED` - HTTP 500
+
+El correo se parseo correctamente, pero fallo la conversion del HTML reconstruido a PDF.
 
 ### `OFFICE_CONVERSION_FAILED` - HTTP 422
 
@@ -449,7 +458,11 @@ Cada request genera logs JSON utiles para debugging, auditoria y soporte:
 - `parserUsed` para `.eml` y `.msg`
 - `hasHtmlBody` y `hasPlainTextBody`
 - subject extraido
+- from extraido
+- cantidad de adjuntos internos
 - cantidad de imagenes inline detectadas
+- cantidad de imagenes CID encontradas
+- cantidad de imagenes CID resueltas
 - warnings de imagenes inline no resueltas
 - cantidad de recursos externos detectados
 - cantidad de recursos fallidos
@@ -465,8 +478,13 @@ Cada request genera logs JSON utiles para debugging, auditoria y soporte:
 
 ### Un `.msg` falla pero el texto existe
 
-- Revisa logs por `EMAIL_PARSE_FAILED`.
+- Revisa logs por `MSG_PARSE_FAILED`.
 - Si el `.msg` no expone HTML, la API intenta usar el cuerpo de texto plano.
+
+### Limitacion conocida para `.msg`
+
+- La resolucion de imagenes inline CID depende de la informacion que `extract-msg` pueda exponer.
+- Si no se pueden resolver, la conversion continua y el PDF muestra un warning visible.
 
 ### Un Office file no convierte
 

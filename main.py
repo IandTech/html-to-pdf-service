@@ -41,6 +41,7 @@ HTML_EXTENSIONS = {".html", ".htm"}
 EMAIL_EXTENSIONS = {".eml", ".msg"}
 OFFICE_EXTENSIONS = {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
 TEXT_EXTENSIONS = {".txt"}
+PDF_EXTENSIONS = {".pdf"}
 
 
 def env_to_bool(value: str | None, default: bool = False) -> bool:
@@ -102,19 +103,33 @@ class ConvertHtmlRequest(BaseModel):
 
 
 @dataclass
+class EmailAttachmentSummary:
+    name: str
+    mime_type: str | None = None
+    size_bytes: int | None = None
+    is_inline: bool = False
+
+
+@dataclass
 class ExtractedEmailContent:
     html: str
     subject: str | None
     sender: str | None
     to: str | None
     cc: str | None
+    bcc: str | None
     date: str | None
+    message_id: str | None
     source_format: str
     parser_used: str
     has_html_body: bool
     has_plain_text_body: bool
+    attachments: list[EmailAttachmentSummary]
     inline_image_count: int = 0
+    cid_found_count: int = 0
+    cid_resolved_count: int = 0
     unresolved_inline_count: int = 0
+    warnings: list[str] | None = None
 
 
 @dataclass
@@ -455,32 +470,56 @@ def build_data_url(resource_bytes: bytes, mime_type: str | None) -> str:
     return f"data:{resolved_mime_type};base64,{encoded}"
 
 
-def embed_inline_resources(html: str, inline_resources: dict[str, dict[str, Any]]) -> str:
+def embed_inline_resources_with_stats(
+    html: str,
+    inline_resources: dict[str, dict[str, Any]],
+) -> tuple[str, int, int, int]:
     if not inline_resources:
-        return html
+        return html, 0, 0, 0
+
+    cid_pattern = r"cid:([^\"' >)]+)"
+    cid_found_count = len(re.findall(cid_pattern, html, flags=re.IGNORECASE))
+    resolved_count = 0
 
     def replace_cid(match: re.Match[str]) -> str:
+        nonlocal resolved_count
         content_id = normalize_content_id(match.group(1))
         resource = inline_resources.get(content_id or "")
         if not resource:
             return match.group(0)
+        resolved_count += 1
         return build_data_url(resource["data"], resource.get("mimeType"))
 
-    return re.sub(r"cid:([^\"' >)]+)", replace_cid, html, flags=re.IGNORECASE)
+    rendered_html = re.sub(cid_pattern, replace_cid, html, flags=re.IGNORECASE)
+    unresolved_count = len(re.findall(cid_pattern, rendered_html, flags=re.IGNORECASE))
+    return rendered_html, cid_found_count, resolved_count, unresolved_count
 
 
 def count_unresolved_cids(html: str) -> int:
     return len(re.findall(r"cid:[^\"' >)]+", html, flags=re.IGNORECASE))
 
 
-def text_to_html_document(text: str) -> str:
+def text_to_html_fragment(text: str) -> str:
     escaped_text = html_escape(text or "")
-    body_html = escaped_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+    return escaped_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+
+def text_to_html_document(text: str) -> str:
+    body_html = text_to_html_fragment(text)
     return (
         "<html><body style=\"font-family: Arial, sans-serif; white-space: normal;\">"
         f"{body_html}"
         "</body></html>"
     )
+
+
+def extract_html_body_fragment(html: str) -> str:
+    body_match = re.search(r"<body[^>]*>(.*)</body>", html, flags=re.IGNORECASE | re.DOTALL)
+    if body_match:
+        return body_match.group(1).strip()
+    html_without_doctype = re.sub(r"<!DOCTYPE[^>]*>", "", html, flags=re.IGNORECASE).strip()
+    html_without_html = re.sub(r"</?html[^>]*>", "", html_without_doctype, flags=re.IGNORECASE).strip()
+    return re.sub(r"</?head[^>]*>.*?</head>", "", html_without_html, flags=re.IGNORECASE | re.DOTALL).strip()
 
 
 def build_email_preview_html(
@@ -495,7 +534,9 @@ def build_email_preview_html(
         ("From", extracted_email.sender),
         ("To", extracted_email.to),
         ("CC", extracted_email.cc),
+        ("BCC", extracted_email.bcc),
         ("Date", extracted_email.date),
+        ("Message-ID", extracted_email.message_id),
         ("TicketId", ticket_id),
     ]
 
@@ -503,35 +544,111 @@ def build_email_preview_html(
     for label, value in fields:
         safe_value = html_escape(value or "")
         metadata_rows.append(
-            "<tr>"
-            f"<th style=\"text-align:left; vertical-align:top; padding:6px 10px; border:1px solid #d9d9d9; background:#f5f5f5; width:180px;\">{html_escape(label)}</th>"
-            f"<td style=\"padding:6px 10px; border:1px solid #d9d9d9;\">{safe_value or '&nbsp;'}</td>"
-            "</tr>"
+            f"<div class=\"metadata-row\"><span class=\"label\">{html_escape(label)}:</span> {safe_value or '&nbsp;'}</div>"
         )
 
-    unresolved_note = ""
+    attachment_items = []
+    for attachment in extracted_email.attachments:
+        item_parts = [html_escape(attachment.name)]
+        if attachment.mime_type:
+            item_parts.append(html_escape(attachment.mime_type))
+        if attachment.size_bytes is not None:
+            item_parts.append(f"{attachment.size_bytes} bytes")
+        if attachment.is_inline:
+            item_parts.append("inline")
+        attachment_items.append(f"<li>{' | '.join(item_parts)}</li>")
+
+    attachments_list_html = "<ul>" + "".join(attachment_items) + "</ul>" if attachment_items else "<p>No se detectaron adjuntos internos.</p>"
+
+    warnings = list(extracted_email.warnings or [])
     if extracted_email.unresolved_inline_count > 0:
-        unresolved_note = (
-            "<p style=\"margin-top:16px; color:#8a6d3b; font-size:12px;\">"
-            f"Nota: {extracted_email.unresolved_inline_count} imagen(es) inline no pudieron resolverse y pueden no aparecer en el PDF."
-            "</p>"
+        warnings.append(
+            f"No se pudieron resolver {extracted_email.unresolved_inline_count} imagen(es) inline CID y pueden no aparecer en el PDF."
         )
 
-    return f"""
+    warnings_html = "".join(
+        f"<div class=\"warning\">{html_escape(warning)}</div>"
+        for warning in warnings
+    )
+
+    body_html = extract_html_body_fragment(extracted_email.html)
+
+    return f"""<!DOCTYPE html>
 <html>
-  <body style="font-family: Arial, sans-serif; color: #1f2937; padding: 18px;">
-    <h1 style="font-size: 24px; margin-bottom: 18px;">Correo adjunto Trade Ticket</h1>
-    <table style="border-collapse: collapse; width: 100%; margin-bottom: 18px;">
-      {''.join(metadata_rows)}
-    </table>
-    <hr style="border: 0; border-top: 1px solid #d9d9d9; margin: 18px 0;">
-    <div style="font-size: 12px; line-height: 1.45;">
-      {extracted_email.html}
-    </div>
-    {unresolved_note}
-  </body>
-</html>
-""".strip()
+<head>
+<meta charset="utf-8">
+<style>
+  body {{
+    font-family: Arial, sans-serif;
+    font-size: 12px;
+    color: #222;
+    margin: 24px;
+  }}
+  .container {{
+    width: 100%;
+  }}
+  .header {{
+    border-bottom: 2px solid #444;
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+  }}
+  .title {{
+    font-size: 18px;
+    font-weight: bold;
+  }}
+  .metadata {{
+    margin-bottom: 16px;
+    border: 1px solid #ddd;
+    padding: 10px;
+    background: #f8f8f8;
+  }}
+  .metadata-row {{
+    margin-bottom: 4px;
+    line-height: 1.4;
+  }}
+  .label {{
+    font-weight: bold;
+  }}
+  .body {{
+    margin-top: 16px;
+  }}
+  .attachments {{
+    margin-top: 24px;
+    border-top: 1px solid #ddd;
+    padding-top: 12px;
+  }}
+  .warning {{
+    margin-top: 12px;
+    color: #9a6700;
+    background: #fff4ce;
+    border: 1px solid #ffcc00;
+    padding: 8px;
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="title">Correo adjunto Trade Ticket</div>
+  </div>
+
+  <div class="metadata">
+    {''.join(metadata_rows)}
+  </div>
+
+  <div class="body">
+    {body_html}
+  </div>
+
+  <div class="attachments">
+    <h3>Adjuntos internos del correo</h3>
+    {attachments_list_html}
+  </div>
+
+  {warnings_html}
+</div>
+</body>
+</html>""".strip()
 
 
 def detect_document_type(item: dict[str, Any], content_mode: str) -> str:
@@ -541,6 +658,8 @@ def detect_document_type(item: dict[str, Any], content_mode: str) -> str:
     if content_mode == "html":
         return "html"
 
+    if extension in PDF_EXTENSIONS:
+        return "pdf"
     if extension in HTML_EXTENSIONS:
         return "html"
     if extension == ".eml":
@@ -554,9 +673,9 @@ def detect_document_type(item: dict[str, Any], content_mode: str) -> str:
 
     raise ServiceError(
         status_code=400,
-        error_code="UNSUPPORTED_EXTENSION",
+        error_code="UNSUPPORTED_FILE_TYPE",
         error_type="ValidationError",
-        message="Solo se soportan archivos .eml y .msg, HTML, Word, Excel y PowerPoint.",
+        message="Solo se soportan tipos de archivo compatibles con la API.",
         technical_detail=f"Received extension: {extension or '(none)'}",
     )
 
@@ -647,7 +766,7 @@ def extract_email_content(file_bytes: bytes, file_name: str | None) -> Extracted
     if not file_bytes:
         raise ServiceError(
             status_code=400,
-            error_code="EMAIL_FILE_EMPTY",
+            error_code="EMPTY_FILE",
             error_type="ValidationError",
             message="The email file received is empty.",
             technical_detail="Uploaded .eml or .msg file contained zero bytes.",
@@ -659,8 +778,8 @@ def extract_email_content(file_bytes: bytes, file_name: str | None) -> Extracted
         return extract_msg_content(file_bytes)
 
     raise ServiceError(
-        status_code=415,
-        error_code="UNSUPPORTED_EMAIL_FILE_TYPE",
+        status_code=400,
+        error_code="UNSUPPORTED_FILE_TYPE",
         error_type="ValidationError",
         message="The uploaded email file type is not supported.",
         technical_detail="Supported file types are .eml and .msg.",
@@ -674,7 +793,7 @@ def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
     except Exception as exc:
         raise ServiceError(
             status_code=422,
-            error_code="EMAIL_PARSE_FAILED",
+            error_code="EML_PARSE_FAILED",
             error_type="ParsingError",
             message="No se pudo extraer el contenido del correo.",
             technical_detail="Python email parser failed to read the .eml file.",
@@ -683,6 +802,7 @@ def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
     html_body: str | None = None
     plain_body: str | None = None
     inline_resources: dict[str, dict[str, Any]] = {}
+    attachments: list[EmailAttachmentSummary] = []
 
     preferred_html = message.get_body(preferencelist=("html",))
     if preferred_html is not None:
@@ -699,6 +819,18 @@ def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
         content_type = part.get_content_type()
         content_id = normalize_content_id(part.get("Content-ID"))
         payload = part.get_payload(decode=True) or b""
+        file_name = part.get_filename()
+        disposition = (part.get_content_disposition() or "").lower()
+
+        if file_name:
+            attachments.append(
+                EmailAttachmentSummary(
+                    name=file_name,
+                    mime_type=content_type,
+                    size_bytes=len(payload),
+                    is_inline=disposition == "inline" or bool(content_id),
+                )
+            )
 
         if content_id and payload:
             inline_resources[content_id] = {
@@ -726,20 +858,33 @@ def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
             technical_detail="No HTML body or plain text body could be extracted from the .eml file.",
         )
 
-    final_html = embed_inline_resources(html_body, inline_resources)
+    final_html, cid_found_count, cid_resolved_count, unresolved_count = embed_inline_resources_with_stats(
+        html_body,
+        inline_resources,
+    )
+    warnings: list[str] = []
+    if unresolved_count > 0:
+        warnings.append("Una o mas imagenes inline CID no pudieron resolverse completamente.")
+
     return ExtractedEmailContent(
         html=final_html,
         subject=message.get("Subject"),
         sender=message.get("From"),
         to=message.get("To"),
         cc=message.get("Cc"),
+        bcc=message.get("Bcc"),
         date=message.get("Date"),
+        message_id=message.get("Message-ID"),
         source_format="eml",
         parser_used="email.parser",
         has_html_body=has_html_body,
         has_plain_text_body=has_plain_text_body,
+        attachments=attachments,
         inline_image_count=len(inline_resources),
-        unresolved_inline_count=count_unresolved_cids(final_html),
+        cid_found_count=cid_found_count,
+        cid_resolved_count=cid_resolved_count,
+        unresolved_inline_count=unresolved_count,
+        warnings=warnings,
     )
 
 
@@ -756,23 +901,34 @@ def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
             html_body = decode_bytes_to_text(getattr(msg, "htmlBody", None))
             plain_body = getattr(msg, "body", None)
             inline_resources: dict[str, dict[str, Any]] = {}
+            attachments: list[EmailAttachmentSummary] = []
 
             for attachment in getattr(msg, "attachments", []):
                 content_id = normalize_content_id(
                     getattr(attachment, "cid", None) or getattr(attachment, "contentId", None)
                 )
                 attachment_data = getattr(attachment, "data", None)
-
-                if not content_id or not isinstance(attachment_data, bytes):
-                    continue
-
                 attachment_name = (
                     getattr(attachment, "name", None)
                     or getattr(attachment, "longFilename", None)
                     or getattr(attachment, "shortFilename", None)
-                    or ""
+                    or "attachment"
                 )
                 mime_type = getattr(attachment, "mimetype", None) or mimetypes.guess_type(attachment_name)[0]
+                size_bytes = len(attachment_data) if isinstance(attachment_data, bytes) else None
+
+                attachments.append(
+                    EmailAttachmentSummary(
+                        name=attachment_name,
+                        mime_type=mime_type,
+                        size_bytes=size_bytes,
+                        is_inline=bool(content_id),
+                    )
+                )
+
+                if not content_id or not isinstance(attachment_data, bytes):
+                    continue
+
                 inline_resources[content_id] = {
                     "data": attachment_data,
                     "mimeType": mime_type or "application/octet-stream",
@@ -793,7 +949,10 @@ def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
                     technical_detail="No HTML body or plain text body found.",
                 )
 
-            final_html = embed_inline_resources(html_body, inline_resources)
+            final_html, cid_found_count, cid_resolved_count, unresolved_count = embed_inline_resources_with_stats(
+                html_body,
+                inline_resources,
+            )
             sender = (
                 getattr(msg, "sender", None)
                 or getattr(msg, "senderEmail", None)
@@ -802,6 +961,9 @@ def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
             to_value = getattr(msg, "to", None)
             cc_value = getattr(msg, "cc", None)
             date_value = decode_bytes_to_text(getattr(msg, "date", None)) or str(getattr(msg, "date", "") or "")
+            warnings: list[str] = []
+            if unresolved_count > 0:
+                warnings.append("Una o mas imagenes inline CID no pudieron resolverse completamente.")
 
             return ExtractedEmailContent(
                 html=final_html,
@@ -809,13 +971,19 @@ def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
                 sender=sender,
                 to=to_value,
                 cc=cc_value,
+                bcc=None,
                 date=date_value or None,
+                message_id=getattr(msg, "messageId", None) or getattr(msg, "message_id", None),
                 source_format="msg",
                 parser_used="extract-msg",
                 has_html_body=has_html_body,
                 has_plain_text_body=has_plain_text_body,
+                attachments=attachments,
                 inline_image_count=len(inline_resources),
-                unresolved_inline_count=count_unresolved_cids(final_html),
+                cid_found_count=cid_found_count,
+                cid_resolved_count=cid_resolved_count,
+                unresolved_inline_count=unresolved_count,
+                warnings=warnings,
             )
         finally:
             if temp_msg_path:
@@ -828,7 +996,7 @@ def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
     except Exception as exc:
         raise ServiceError(
             status_code=422,
-            error_code="EMAIL_PARSE_FAILED",
+            error_code="MSG_PARSE_FAILED",
             error_type="ParsingError",
             message="No se pudo procesar el archivo .msg.",
             technical_detail="extract-msg failed with controlled error.",
@@ -1046,6 +1214,33 @@ async def process_universal_item(
     request.state.html_size = len(file_bytes)
     extension = detect_file_extension(original_file_name)
 
+    if detected_type == "pdf":
+        parse_time_ms = round((time.perf_counter() - parse_start) * 1000, 2)
+        request.state.final_status = "SUCCESS"
+        request.state.failed_resource_count = 0
+        request.state.external_resource_count = 0
+        log_event(
+            logging.INFO,
+            "document_parsed",
+            traceId=request.state.trace_id,
+            index=index,
+            originalFileName=original_file_name,
+            detectedType=detected_type,
+            fileExtension=extension,
+            fileSizeBytes=len(file_bytes),
+            parseTimeMs=parse_time_ms,
+            metadata=metadata,
+        )
+        return ProcessedItemResult(
+            index=index,
+            original_file_name=original_file_name or "document.pdf",
+            output_file_name=output_file_name,
+            detected_type=detected_type,
+            pdf_bytes=file_bytes,
+            metadata={"detectedType": detected_type, **metadata},
+            response_headers={"Content-Disposition": f'attachment; filename="{output_file_name}"'},
+        )
+
     if detected_type == "html":
         html_text = decode_bytes_to_text(file_bytes)
         parse_time_ms = round((time.perf_counter() - parse_start) * 1000, 2)
@@ -1109,8 +1304,13 @@ async def process_universal_item(
             hasHtmlBody=extracted_email.has_html_body,
             hasPlainTextBody=extracted_email.has_plain_text_body,
             extractedSubject=extracted_email.subject,
+            extractedFrom=extracted_email.sender,
+            internalAttachmentCount=len(extracted_email.attachments),
             inlineImageCount=extracted_email.inline_image_count,
+            cidFoundCount=extracted_email.cid_found_count,
+            cidResolvedCount=extracted_email.cid_resolved_count,
             unresolvedInlineImageCount=extracted_email.unresolved_inline_count,
+            warnings=extracted_email.warnings or [],
             parseTimeMs=parse_time_ms,
             metadata=metadata,
         )
@@ -1126,12 +1326,25 @@ async def process_universal_item(
                 parserUsed=extracted_email.parser_used,
                 warningCode="EMAIL_INLINE_IMAGE_WARNING",
                 inlineImageCount=extracted_email.inline_image_count,
+                cidFoundCount=extracted_email.cid_found_count,
+                cidResolvedCount=extracted_email.cid_resolved_count,
                 unresolvedInlineImageCount=extracted_email.unresolved_inline_count,
                 message="One or more inline email images could not be resolved.",
             )
 
         render_start = time.perf_counter()
-        rendered = await render_pdf_document(preview_html, output_file_name, request)
+        try:
+            rendered = await render_pdf_document(preview_html, output_file_name, request)
+        except ServiceError as exc:
+            if exc.error_code == "PDF_RENDER_TIMEOUT":
+                raise
+            raise ServiceError(
+                status_code=500,
+                error_code="EMAIL_RENDER_FAILED",
+                error_type="RenderError",
+                message="No se pudo convertir el correo adjunto a PDF.",
+                technical_detail="The parsed email content could not be rendered to PDF.",
+            ) from exc
         render_time_ms = round((time.perf_counter() - render_start) * 1000, 2)
 
         log_event(
@@ -1152,7 +1365,9 @@ async def process_universal_item(
             "from": extracted_email.sender,
             "to": extracted_email.to,
             "cc": extracted_email.cc,
+            "bcc": extracted_email.bcc,
             "date": extracted_email.date,
+            "messageId": extracted_email.message_id,
         }
         return ProcessedItemResult(
             index=index,
