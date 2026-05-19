@@ -10,3 +10,5 @@ services:
         value: 30000
       - key: LOG_LEVEL
         value: INFO
+      - key: STRICT_EXTERNAL_RESOURCES
+        value: false

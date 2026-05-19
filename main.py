@@ -30,10 +30,20 @@ SERVICE_VERSION = "1.0.0"
 DEFAULT_FILE_NAME = "document.pdf"
 
 
+def env_to_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class Settings:
     def __init__(self) -> None:
         self.render_timeout_ms = int(os.getenv("RENDER_TIMEOUT_MS", "30000"))
         self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+        self.strict_external_resources = env_to_bool(
+            os.getenv("STRICT_EXTERNAL_RESOURCES"),
+            default=False,
+        )
 
 
 settings = Settings()
@@ -486,25 +496,44 @@ async def convert_html_to_pdf(payload: ConvertHtmlRequest, request: Request) -> 
 
         if failed_resources:
             request.state.failed_resource_count = len(failed_resources)
-            raise ServiceError(
-                status_code=422,
-                error_code="EXTERNAL_RESOURCE_LOAD_FAILED",
-                error_type="ExternalResourceError",
-                message="One or more external resources could not be loaded.",
-                technical_detail="Chromium reported network failures while loading external resources.",
-                details={
-                    "failedResourceCount": len(failed_resources),
-                    "failedResources": failed_resources,
-                },
+            failed_resource_details = {
+                "failedResourceCount": len(failed_resources),
+                "failedResources": failed_resources,
+            }
+
+            if settings.strict_external_resources:
+                raise ServiceError(
+                    status_code=422,
+                    error_code="EXTERNAL_RESOURCE_LOAD_FAILED",
+                    error_type="ExternalResourceError",
+                    message="One or more external resources could not be loaded.",
+                    technical_detail="Chromium reported network failures while loading external resources.",
+                    details=failed_resource_details,
+                )
+
+            request.state.final_status = "SUCCESS_WITH_RESOURCE_WARNINGS"
+            log_event(
+                logging.WARNING,
+                "external_resources_failed_nonfatal",
+                traceId=request.state.trace_id,
+                fileName=file_name,
+                failedResourceCount=len(failed_resources),
+                failedResources=failed_resources,
             )
 
-        request.state.failed_resource_count = 0
-        request.state.final_status = "SUCCESS"
+        if not failed_resources:
+            request.state.failed_resource_count = 0
+            request.state.final_status = "SUCCESS"
+
+        response_headers = {"Content-Disposition": f'attachment; filename="{file_name}"'}
+        if failed_resources and not settings.strict_external_resources:
+            response_headers["X-External-Resources-Status"] = "warning"
+            response_headers["X-Failed-Resource-Count"] = str(len(failed_resources))
 
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
+            headers=response_headers,
         )
     finally:
         if page is not None:

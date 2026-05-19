@@ -79,6 +79,7 @@ Respuesta exitosa:
 
 - `RENDER_TIMEOUT_MS`: timeout máximo en milisegundos para render y generación PDF. Default `30000`.
 - `LOG_LEVEL`: nivel de logging. Default `INFO`.
+- `STRICT_EXTERNAL_RESOURCES`: si es `true`, la API devuelve `422` cuando falla cualquier recurso externo. Default `false`.
 
 ## Ejecución local con Docker
 
@@ -94,6 +95,7 @@ docker build -t html-to-pdf-service .
 docker run --rm -p 10000:10000 \
   -e RENDER_TIMEOUT_MS=30000 \
   -e LOG_LEVEL=INFO \
+  -e STRICT_EXTERNAL_RESOURCES=false \
   html-to-pdf-service
 ```
 
@@ -181,6 +183,7 @@ Si luego necesitas adjuntar o guardar el PDF, consume el body binario de la resp
 5. Configura variables si quieres ajustar timeout o nivel de logs:
    - `RENDER_TIMEOUT_MS=30000`
    - `LOG_LEVEL=INFO`
+   - `STRICT_EXTERNAL_RESOURCES=false`
 6. Usa `/health` como health check.
 
 ### Opción 2. Usando `render.yaml`
@@ -217,7 +220,7 @@ Se devuelve cuando Chromium excede el timeout configurado durante `set_content` 
 
 ### `EXTERNAL_RESOURCE_LOAD_FAILED` - HTTP 422
 
-Se devuelve cuando Playwright detecta uno o más recursos externos fallidos. La respuesta incluye:
+Se devuelve cuando Playwright detecta uno o más recursos externos fallidos y `STRICT_EXTERNAL_RESOURCES=true`. La respuesta incluye:
 
 ```json
 {
@@ -256,6 +259,12 @@ Cada request genera logs JSON útiles para debugging, auditoría y soporte:
 - cantidad de recursos fallidos
 - status final del request
 
+Cuando `STRICT_EXTERNAL_RESOURCES=false`, los recursos externos fallidos se registran como advertencia no fatal. En ese caso:
+
+- la API sigue devolviendo `200` con el PDF
+- se agregan headers `X-External-Resources-Status: warning` y `X-Failed-Resource-Count`
+- el status final en logs será `SUCCESS_WITH_RESOURCE_WARNINGS`
+
 Ejemplo:
 
 ```json
@@ -286,7 +295,8 @@ Ejemplo:
 ### El PDF sale sin imágenes o estilos
 
 - Verifica que las URLs externas sean accesibles desde Internet y no requieran autenticación.
-- Revisa si la respuesta fue `422 EXTERNAL_RESOURCE_LOAD_FAILED`.
+- Si `STRICT_EXTERNAL_RESOURCES=true`, revisa si la respuesta fue `422 EXTERNAL_RESOURCE_LOAD_FAILED`.
+- Si `STRICT_EXTERNAL_RESOURCES=false`, revisa los headers `X-External-Resources-Status` y `X-Failed-Resource-Count`.
 - Confirma que el HTML entregue URLs absolutas `https://`.
 
 ### El proceso tarda demasiado
