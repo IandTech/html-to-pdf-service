@@ -310,6 +310,9 @@ async def request_context_middleware(request: Request, call_next):
     processing_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
     response.headers["X-Trace-Id"] = trace_id
 
+    if request.state.final_status == "started":
+        request.state.final_status = "SUCCESS" if response.status_code < 400 else f"HTTP_{response.status_code}"
+
     log_event(
         logging.INFO,
         "request_completed",
@@ -421,6 +424,11 @@ async def health() -> dict[str, str]:
         "browser": browser_status,
         "environment": "render",
     }
+
+
+@app.get("/favicon.ico")
+async def favicon() -> Response:
+    return Response(status_code=204)
 
 
 @app.post("/convert/html-to-pdf")
