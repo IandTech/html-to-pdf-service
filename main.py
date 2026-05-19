@@ -1357,7 +1357,7 @@ async def convert_html_to_pdf(payload: ConvertHtmlRequest, request: Request) -> 
     return await render_pdf_response(payload.html, file_name, request)
 
 
-@app.post("/convert/to-pdf")
+@app.post("/convert/to-pdf", response_model=None)
 async def convert_to_pdf(request: Request, payload: dict[str, Any] = Body(...)) -> Response | JSONResponse:
     items = normalize_universal_items(payload)
 
