@@ -440,13 +440,13 @@ async def convert_html_to_pdf(payload: ConvertHtmlRequest, request: Request) -> 
         context, page = await create_page(browser_manager.browser)
 
         def on_request_failed(failed_request) -> None:
-            failure = failed_request.failure
+            failure_text = failed_request.failure or "Unknown request failure"
             failed_resources.append(
                 {
                     "url": failed_request.url,
                     "method": failed_request.method,
                     "resourceType": failed_request.resource_type,
-                    "errorText": failure["errorText"] if failure else "Unknown request failure",
+                    "errorText": failure_text,
                 }
             )
 
