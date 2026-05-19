@@ -110,6 +110,10 @@ class ExtractedEmailContent:
     cc: str | None
     date: str | None
     source_format: str
+    parser_used: str
+    has_html_body: bool
+    has_plain_text_body: bool
+    inline_image_count: int = 0
     unresolved_inline_count: int = 0
 
 
@@ -670,7 +674,7 @@ def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
     except Exception as exc:
         raise ServiceError(
             status_code=422,
-            error_code="EMAIL_CONTENT_EXTRACTION_FAILED",
+            error_code="EMAIL_PARSE_FAILED",
             error_type="ParsingError",
             message="No se pudo extraer el contenido del correo.",
             technical_detail="Python email parser failed to read the .eml file.",
@@ -707,6 +711,9 @@ def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
         elif plain_body is None and content_type == "text/plain":
             plain_body = part.get_content()
 
+    has_html_body = bool(html_body)
+    has_plain_text_body = bool(plain_body)
+
     if not html_body and plain_body:
         html_body = text_to_html_document(plain_body)
 
@@ -728,6 +735,10 @@ def extract_eml_content(file_bytes: bytes) -> ExtractedEmailContent:
         cc=message.get("Cc"),
         date=message.get("Date"),
         source_format="eml",
+        parser_used="email.parser",
+        has_html_body=has_html_body,
+        has_plain_text_body=has_plain_text_body,
+        inline_image_count=len(inline_resources),
         unresolved_inline_count=count_unresolved_cids(final_html),
     )
 
@@ -767,6 +778,9 @@ def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
                     "mimeType": mime_type or "application/octet-stream",
                 }
 
+            has_html_body = bool(html_body)
+            has_plain_text_body = bool(plain_body)
+
             if not html_body and plain_body:
                 html_body = text_to_html_document(plain_body)
 
@@ -797,6 +811,10 @@ def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
                 cc=cc_value,
                 date=date_value or None,
                 source_format="msg",
+                parser_used="extract-msg",
+                has_html_body=has_html_body,
+                has_plain_text_body=has_plain_text_body,
+                inline_image_count=len(inline_resources),
                 unresolved_inline_count=count_unresolved_cids(final_html),
             )
         finally:
@@ -810,7 +828,7 @@ def extract_msg_content(file_bytes: bytes) -> ExtractedEmailContent:
     except Exception as exc:
         raise ServiceError(
             status_code=422,
-            error_code="MSG_PARSE_FAILED",
+            error_code="EMAIL_PARSE_FAILED",
             error_type="ParsingError",
             message="No se pudo procesar el archivo .msg.",
             technical_detail="extract-msg failed with controlled error.",
@@ -1087,9 +1105,30 @@ async def process_universal_item(
             detectedType=detected_type,
             fileExtension=extension,
             fileSizeBytes=len(file_bytes),
+            parserUsed=extracted_email.parser_used,
+            hasHtmlBody=extracted_email.has_html_body,
+            hasPlainTextBody=extracted_email.has_plain_text_body,
+            extractedSubject=extracted_email.subject,
+            inlineImageCount=extracted_email.inline_image_count,
+            unresolvedInlineImageCount=extracted_email.unresolved_inline_count,
             parseTimeMs=parse_time_ms,
             metadata=metadata,
         )
+
+        if extracted_email.unresolved_inline_count > 0:
+            log_event(
+                logging.WARNING,
+                "email_inline_image_warning",
+                traceId=request.state.trace_id,
+                index=index,
+                originalFileName=original_file_name,
+                detectedType=detected_type,
+                parserUsed=extracted_email.parser_used,
+                warningCode="EMAIL_INLINE_IMAGE_WARNING",
+                inlineImageCount=extracted_email.inline_image_count,
+                unresolvedInlineImageCount=extracted_email.unresolved_inline_count,
+                message="One or more inline email images could not be resolved.",
+            )
 
         render_start = time.perf_counter()
         rendered = await render_pdf_document(preview_html, output_file_name, request)

@@ -406,9 +406,13 @@ La extension del documento no es soportada por el endpoint universal.
 
 No se encontro cuerpo HTML ni texto plano renderizable dentro del correo.
 
-### `MSG_PARSE_FAILED` - HTTP 422
+### `EMAIL_PARSE_FAILED` - HTTP 422
 
-`extract-msg` no pudo procesar el archivo `.msg`.
+No se pudo parsear correctamente el archivo `.eml` o `.msg`.
+
+### `EMAIL_INLINE_IMAGE_WARNING`
+
+No rompe la conversion. Se registra en logs cuando una o mas imagenes inline `cid:` no pudieron resolverse.
 
 ### `OFFICE_CONVERSION_FAILED` - HTTP 422
 
@@ -442,6 +446,11 @@ Cada request genera logs JSON utiles para debugging, auditoria y soporte:
 - metadata recibida
 - tiempo de parseo por documento
 - tiempo de render por documento
+- `parserUsed` para `.eml` y `.msg`
+- `hasHtmlBody` y `hasPlainTextBody`
+- subject extraido
+- cantidad de imagenes inline detectadas
+- warnings de imagenes inline no resueltas
 - cantidad de recursos externos detectados
 - cantidad de recursos fallidos
 - status final del request
@@ -456,7 +465,7 @@ Cada request genera logs JSON utiles para debugging, auditoria y soporte:
 
 ### Un `.msg` falla pero el texto existe
 
-- Revisa logs por `MSG_PARSE_FAILED`.
+- Revisa logs por `EMAIL_PARSE_FAILED`.
 - Si el `.msg` no expone HTML, la API intenta usar el cuerpo de texto plano.
 
 ### Un Office file no convierte
